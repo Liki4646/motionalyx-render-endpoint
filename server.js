@@ -6,14 +6,16 @@ import path from "path";
 import os from "os";
 import https from "https";
 import http from "http";
+import crypto from "crypto";
 
 const app = express();
 app.set("trust proxy", 1);
 
 const PUBLIC_DIR = path.join(os.tmpdir(), "mxpublic");
+const CACHE_DIR = path.join(os.tmpdir(), "mxcache");
 fs.mkdirSync(PUBLIC_DIR, { recursive: true });
+fs.mkdirSync(CACHE_DIR, { recursive: true });
 
-// Serve rendered files from a public temp folder
 app.use(
   "/tmp",
   express.static(PUBLIC_DIR, {
@@ -31,14 +33,18 @@ const upload = multer({
   limits: { fileSize: 60 * 1024 * 1024 } // 60MB
 });
 
-// Health check
 app.get("/health", (_, res) => res.status(200).json({ ok: true }));
 
-function downloadToFile(url, outPath) {
+function sha1(s) {
+  return crypto.createHash("sha1").update(String(s)).digest("hex");
+}
+
+function downloadToFile(url, outPath, timeoutMs = 20000) {
   return new Promise((resolve, reject) => {
     const client = url.startsWith("https") ? https : http;
+
     const req = client.get(url, (res) => {
-      // Handle redirects (common on CDNs)
+      // redirects
       if (
         res.statusCode &&
         res.statusCode >= 300 &&
@@ -46,31 +52,63 @@ function downloadToFile(url, outPath) {
         res.headers.location
       ) {
         res.resume();
-        return downloadToFile(res.headers.location, outPath).then(resolve).catch(reject);
+        return downloadToFile(res.headers.location, outPath, timeoutMs)
+          .then(resolve)
+          .catch(reject);
       }
 
       if (res.statusCode !== 200) {
-        reject(new Error(`Failed to download background: ${res.statusCode}`));
         res.resume();
+        reject(new Error(`Failed to download background: ${res.statusCode}`));
         return;
       }
 
       const file = fs.createWriteStream(outPath);
       res.pipe(file);
+
       file.on("finish", () => file.close(resolve));
       file.on("error", reject);
+
+      res.on("error", reject);
+    });
+
+    req.setTimeout(timeoutMs, () => {
+      req.destroy(new Error(`Background download timed out after ${timeoutMs}ms`));
     });
 
     req.on("error", reject);
   });
 }
 
-function runFfmpeg(args) {
+async function getOrDownloadBackground(bgUrl) {
+  const ext = path.extname(new URL(bgUrl).pathname || "") || ".bin";
+  const key = sha1(bgUrl);
+  const cached = path.join(CACHE_DIR, `${key}${ext}`);
+
+  if (fs.existsSync(cached) && fs.statSync(cached).size > 0) {
+    return cached;
+  }
+
+  const tmp = cached + ".part";
+  await downloadToFile(bgUrl, tmp, 20000);
+  fs.renameSync(tmp, cached);
+  return cached;
+}
+
+function runFfmpeg(args, timeoutMs = 240000) {
+  // kill ffmpeg if it runs too long
   return new Promise((resolve, reject) => {
-    execFile("ffmpeg", args, { maxBuffer: 1024 * 1024 * 60 }, (err, stdout, stderr) => {
+    const child = execFile("ffmpeg", args, { maxBuffer: 1024 * 1024 * 60 }, (err, stdout, stderr) => {
       if (err) reject(new Error(stderr || err.message));
       else resolve({ stdout, stderr });
     });
+
+    const t = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(new Error(`ffmpeg timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+
+    child.on("exit", () => clearTimeout(t));
   });
 }
 
@@ -84,7 +122,6 @@ function runFfprobe(args) {
 }
 
 async function getAudioDurationMs(audioPath) {
-  // Best-effort: duration in ms
   const { stdout } = await runFfprobe([
     "-v",
     "error",
@@ -94,14 +131,12 @@ async function getAudioDurationMs(audioPath) {
     "default=nw=1:nk=1",
     audioPath
   ]);
-
   const seconds = parseFloat(String(stdout).trim());
   if (!Number.isFinite(seconds) || seconds <= 0) return null;
   return Math.round(seconds * 1000);
 }
 
 // ---------- Subtitle helpers ----------
-
 const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
 
 function msToAssTime(ms) {
@@ -115,7 +150,6 @@ function msToAssTime(ms) {
 }
 
 function escapeAssText(text) {
-  // Remove braces to avoid ASS override tags, normalize whitespace, escape backslashes.
   let t = String(text ?? "");
   t = t.replace(/[\r\n]+/g, " ").trim();
   t = t.replace(/[{}]/g, "");
@@ -123,7 +157,6 @@ function escapeAssText(text) {
   return t;
 }
 
-// Wrap into max 2 lines, aiming for maxLen per line
 function wrapTwoLines(text, maxLen = 26) {
   const t = String(text ?? "").trim();
   if (t.length <= maxLen) return t;
@@ -148,19 +181,15 @@ function wrapTwoLines(text, maxLen = 26) {
     if ((line2 + " " + w).length <= maxLen) {
       line2 += " " + w;
     } else {
-      break; // max 2 lines
+      break;
     }
   }
 
-  if (!line2) {
-    // hard split if we couldn't create a second line
-    return t.slice(0, maxLen) + "\\N" + t.slice(maxLen, maxLen * 2);
-  }
+  if (!line2) return t.slice(0, maxLen) + "\\N" + t.slice(maxLen, maxLen * 2);
   return `${line1}\\N${line2}`;
 }
 
 function normalizeSubtitleLines(rawLines) {
-  // Basic cleanup: keep valid, sort, fix negatives, ensure end>start
   const cleaned = (Array.isArray(rawLines) ? rawLines : [])
     .filter((l) => typeof l?.start_ms === "number" && typeof l?.end_ms === "number" && l?.text)
     .map((l) => ({
@@ -170,40 +199,29 @@ function normalizeSubtitleLines(rawLines) {
     }))
     .sort((a, b) => a.start_ms - b.start_ms);
 
-  // Ensure increasing & no overlaps (soft)
+  // make increasing, remove overlaps softly
   let prevEnd = 0;
   const out = [];
   for (const l of cleaned) {
-    let start = Math.max(l.start_ms, prevEnd);
-    let end = Math.max(l.end_ms, start + 200); // temporary, refined later
+    const start = Math.max(l.start_ms, prevEnd);
+    const end = Math.max(l.end_ms, start + 200);
     out.push({ start_ms: start, end_ms: end, text: l.text });
     prevEnd = end;
   }
   return out;
 }
 
-function enforceDurationsAndConsecutive(lines, minDur = 650, maxDur = 2200) {
-  // Forces consecutive chunks with min/max durations.
-  // Keeps order; adjusts end times; removes overlaps/gaps.
+function enforceConsecutiveWithClamp(lines, minDur = 650, maxDur = 2200) {
   if (!Array.isArray(lines) || lines.length === 0) return [];
-
   const out = [];
   let cursor = 0;
 
   for (const l of lines) {
-    let start = Math.max(cursor, Math.floor(l.start_ms));
-    let desiredEnd = Math.floor(l.end_ms);
+    const origDur = Math.max(1, l.end_ms - l.start_ms);
+    const dur = clamp(origDur, minDur, maxDur);
 
-    // Make it consecutive: start exactly at cursor
-    start = cursor;
-
-    // Derive duration from original, then clamp
-    let dur = desiredEnd - Math.floor(l.start_ms);
-    if (!Number.isFinite(dur)) dur = maxDur;
-
-    dur = clamp(dur, minDur, maxDur);
-    let end = start + dur;
-
+    const start = cursor;
+    const end = start + dur;
     out.push({ start_ms: start, end_ms: end, text: l.text });
     cursor = end;
   }
@@ -211,55 +229,38 @@ function enforceDurationsAndConsecutive(lines, minDur = 650, maxDur = 2200) {
   return out;
 }
 
-function proportionalFitToTarget(lines, targetMs) {
-  if (!Array.isArray(lines) || lines.length === 0) return [];
+function proportionalFitToAudio(lines, audioMs) {
+  if (!audioMs || !lines.length) return lines;
+
+  // clamp to keep reels reasonable
+  const target = clamp(audioMs, 8000, 28000);
 
   const lastEnd = lines[lines.length - 1].end_ms;
   if (!lastEnd || lastEnd <= 0) return lines;
 
-  const scale = targetMs / lastEnd;
-
-  // Scale starts/ends
-  const scaled = lines.map((l) => ({
-    start_ms: Math.floor(l.start_ms * scale),
-    end_ms: Math.floor(l.end_ms * scale),
-    text: l.text
-  }));
-
-  // Re-normalize consecutive + min/max durations
-  const normalized = enforceDurationsAndConsecutive(scaled, 650, 2200);
-
-  // Force final end exactly to target (keeps exact match to audio)
-  normalized[normalized.length - 1].end_ms = targetMs;
-
-  return normalized;
-}
-
-function decideAndFitTimeline(lines, audioMs) {
-  // If we can’t read audio duration, leave as-is after basic normalization
-  if (!audioMs || !Number.isFinite(audioMs) || audioMs <= 0) return lines;
-
-  // Keep reels in a sensible range (you can change these later)
-  const target = clamp(audioMs, 8000, 28000);
-
-  const lastEnd = lines.length ? lines[lines.length - 1].end_ms : 0;
-  if (!lastEnd) return lines;
-
   const delta = target - lastEnd;
 
-  // If it's already very close (<= 350ms), tiny fix: align final end only
+  // tiny mismatch: just align end
   if (Math.abs(delta) <= 350) {
     const out = [...lines];
     out[out.length - 1] = { ...out[out.length - 1], end_ms: target };
     return out;
   }
 
-  // Otherwise, do full proportional scaling (your preference)
-  return proportionalFitToTarget(lines, target);
+  // scale everything
+  const scale = target / lastEnd;
+  const scaled = lines.map((l) => ({
+    start_ms: Math.floor(l.start_ms * scale),
+    end_ms: Math.floor(l.end_ms * scale),
+    text: l.text
+  }));
+
+  const normalized = enforceConsecutiveWithClamp(scaled, 650, 2200);
+  normalized[normalized.length - 1].end_ms = target;
+  return normalized;
 }
 
 function escapeDrawtext(s) {
-  // ffmpeg drawtext escaping: backslash, colon, apostrophe, percent
   let t = String(s ?? "");
   t = t.replace(/\\/g, "\\\\");
   t = t.replace(/:/g, "\\:");
@@ -269,13 +270,8 @@ function escapeDrawtext(s) {
   return t;
 }
 
-// DejaVu ttf exists with fonts-dejavu-core on Debian bookworm
 const DEJAVU_TTF = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
 
-// POST /render
-// multipart/form-data:
-// - audio: file (mp3)
-// - payload: text (JSON string)
 app.post("/render", upload.single("audio"), async (req, res) => {
   let workDir = null;
 
@@ -290,7 +286,6 @@ app.post("/render", upload.single("audio"), async (req, res) => {
       return res.status(400).json({ error: "Payload is not valid JSON." });
     }
 
-    // Current payload paths (keep compatible with your Make)
     const bgUrl = payload?.assets?.background_template_url;
     const title = payload?.text?.title ?? "";
     const footer = payload?.text?.footer ?? "";
@@ -299,23 +294,17 @@ app.post("/render", upload.single("audio"), async (req, res) => {
     if (!bgUrl) return res.status(400).json({ error: "payload.assets.background_template_url is required." });
     if (!Array.isArray(rawLines)) return res.status(400).json({ error: "payload.subtitles.lines must be an array." });
 
-    // Temp working dir
     workDir = fs.mkdtempSync(path.join(os.tmpdir(), "mxrender-"));
     const audioPath = path.join(workDir, "audio.mp3");
+    fs.writeFileSync(audioPath, req.file.buffer);
 
-    // Public output
     const publicName = `mx_${Date.now()}_${Math.random().toString(16).slice(2)}.mp4`;
     const publicOutPath = path.join(PUBLIC_DIR, publicName);
 
-    fs.writeFileSync(audioPath, req.file.buffer);
+    // background: cached download
+    const bgFile = await getOrDownloadBackground(bgUrl);
 
-    // Download background (png/jpg/mp4)
-    const urlObj = new URL(bgUrl);
-    const ext = path.extname(urlObj.pathname || "").replace(".", "") || "mp4";
-    const bgFile = path.join(workDir, `bg.${ext}`);
-    await downloadToFile(bgUrl, bgFile);
-
-    // Measure audio duration
+    // audio duration -> subtitle fit + hard -t
     let audioMs = null;
     try {
       audioMs = await getAudioDurationMs(audioPath);
@@ -323,26 +312,24 @@ app.post("/render", upload.single("audio"), async (req, res) => {
       audioMs = null;
     }
 
-    // Subtitle pipeline:
-    // 1) normalize
-    // 2) enforce reasonable durations (initial)
-    // 3) proportional fit to audio target (scale everything)
-    // 4) final enforce consecutive + min/max
-    let lines = normalizeSubtitleLines(rawLines);
-    lines = enforceDurationsAndConsecutive(lines, 650, 2200);
-    lines = decideAndFitTimeline(lines, audioMs);
-    lines = enforceDurationsAndConsecutive(lines, 650, 2200);
+    const targetMs = audioMs ? clamp(audioMs, 8000, 28000) : 15000;
+    const targetSec = (targetMs / 1000).toFixed(3);
 
-    // Build ASS subtitle file (premium defaults)
+    // subtitle pipeline
+    let lines = normalizeSubtitleLines(rawLines);
+    lines = enforceConsecutiveWithClamp(lines, 650, 2200);
+    lines = proportionalFitToAudio(lines, targetMs);
+    lines = enforceConsecutiveWithClamp(lines, 650, 2200);
+
+    // ASS file
     const assPath = path.join(workDir, "subs.ass");
 
-    // Safer subtitle placement (avoid IG UI): bottom-center but lifted up
     const ASS_FONT = "DejaVu Sans";
     const SUB_FONT_SIZE = 56;
     const OUTLINE = 6;
     const SHADOW = 1;
     const MARGIN_LR = 120;
-    const MARGIN_V = 420; // higher = safer (less likely to collide with UI/footer)
+    const MARGIN_V = 420;
 
     const assHeader = `[Script Info]
 Title: Motionalyx Subtitles
@@ -373,7 +360,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
     fs.writeFileSync(assPath, assHeader + assEvents + "\n");
 
-    // Title/Footer drawtext (use fontfile to avoid fallback)
+    // drawtext title/footer
     const tTitle = escapeDrawtext(title);
     const tFooter = escapeDrawtext(footer);
 
@@ -389,21 +376,22 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
     const isImage = /\.(png|jpg|jpeg)$/i.test(bgFile);
 
-    // Encoding: decent quality + fast, IG-friendly MP4
+    // Faster encoding to reduce timeouts
     const commonVideoArgs = [
       "-c:v",
       "libx264",
       "-preset",
-      "veryfast",
+      "ultrafast",
       "-crf",
-      "24",
+      "28",
       "-movflags",
       "+faststart",
       "-pix_fmt",
       "yuv420p",
       "-vf",
       vf,
-      "-shortest",
+      "-t",
+      targetSec,
       "-r",
       "30",
       "-s",
@@ -415,22 +403,11 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     ];
 
     const args = isImage
-      ? [
-          "-y",
-          "-loop",
-          "1",
-          "-i",
-          bgFile,
-          "-i",
-          audioPath,
-          "-tune",
-          "stillimage",
-          ...commonVideoArgs,
-          publicOutPath
-        ]
+      ? ["-y", "-loop", "1", "-i", bgFile, "-i", audioPath, "-tune", "stillimage", ...commonVideoArgs, publicOutPath]
       : ["-y", "-i", bgFile, "-i", audioPath, ...commonVideoArgs, publicOutPath];
 
-    await runFfmpeg(args);
+    // ffmpeg timeout: 240s
+    await runFfmpeg(args, 240000);
 
     const proto = req.get("x-forwarded-proto") || req.protocol;
     const baseUrl = `${proto}://${req.get("host")}`;
@@ -442,7 +419,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
   } catch (e) {
     return res.status(500).json({ error: String(e?.message || e) });
   } finally {
-    // Best-effort cleanup (keeps public mp4 in PUBLIC_DIR)
     try {
       if (workDir) fs.rmSync(workDir, { recursive: true, force: true });
     } catch {}
