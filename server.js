@@ -11,11 +11,13 @@ import crypto from "crypto";
 const app = express();
 app.set("trust proxy", 1);
 
+// -------------------- Directories --------------------
 const PUBLIC_DIR = path.join(os.tmpdir(), "mxpublic");
 const CACHE_DIR = path.join(os.tmpdir(), "mxcache");
 fs.mkdirSync(PUBLIC_DIR, { recursive: true });
 fs.mkdirSync(CACHE_DIR, { recursive: true });
 
+// serve rendered files
 app.use(
   "/tmp",
   express.static(PUBLIC_DIR, {
@@ -28,28 +30,34 @@ app.use(
   })
 );
 
+// -------------------- Upload --------------------
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 60 * 1024 * 1024 }
 });
 
-// ====== SETTINGS ======
-const EXTRA_TAIL_MS = 4000;        // video = audio + 4s
-const FFMPEG_TIMEOUT_MS = 240000;  // kill ffmpeg if it runs too long
+// -------------------- Settings --------------------
+const EXTRA_TAIL_MS = 4000;               // end card length
+const FFMPEG_TIMEOUT_MS = 180000;         // keep under Make 300s (3 min)
+const DOWNLOAD_TIMEOUT_MS = 20000;
 
+const DEJAVU_TTF = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
+
+// -------------------- Health --------------------
+app.get("/", (_, res) => res.status(200).send("ok"));
 app.get("/health", (_, res) => res.status(200).json({ ok: true }));
 
-// ---------- Download + cache helpers ----------
+// -------------------- Helpers --------------------
 function sha1(s) {
   return crypto.createHash("sha1").update(String(s)).digest("hex");
 }
 
-function downloadToFile(url, outPath, timeoutMs = 20000) {
+function downloadToFile(url, outPath, timeoutMs = DOWNLOAD_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
     const client = url.startsWith("https") ? https : http;
 
     const req = client.get(url, (res) => {
-      // redirects
+      // follow redirects
       if (
         res.statusCode &&
         res.statusCode >= 300 &&
@@ -64,8 +72,7 @@ function downloadToFile(url, outPath, timeoutMs = 20000) {
 
       if (res.statusCode !== 200) {
         res.resume();
-        reject(new Error(`Failed to download asset: ${res.statusCode}`));
-        return;
+        return reject(new Error(`Failed to download asset: ${res.statusCode}`));
       }
 
       const file = fs.createWriteStream(outPath);
@@ -93,31 +100,9 @@ async function getOrDownload(url) {
   if (fs.existsSync(cached) && fs.statSync(cached).size > 0) return cached;
 
   const tmp = cached + ".part";
-  await downloadToFile(url, tmp, 20000);
+  await downloadToFile(url, tmp, DOWNLOAD_TIMEOUT_MS);
   fs.renameSync(tmp, cached);
   return cached;
-}
-
-// ---------- ffmpeg helpers ----------
-function runFfmpeg(args, timeoutMs = FFMPEG_TIMEOUT_MS) {
-  return new Promise((resolve, reject) => {
-    const child = execFile(
-      "ffmpeg",
-      args,
-      { maxBuffer: 1024 * 1024 * 60 },
-      (err, stdout, stderr) => {
-        if (err) reject(new Error(stderr || err.message));
-        else resolve({ stdout, stderr });
-      }
-    );
-
-    const t = setTimeout(() => {
-      child.kill("SIGKILL");
-      reject(new Error(`ffmpeg timed out after ${timeoutMs}ms`));
-    }, timeoutMs);
-
-    child.on("exit", () => clearTimeout(t));
-  });
 }
 
 function runFfprobe(args) {
@@ -144,9 +129,30 @@ async function getAudioDurationMs(audioPath) {
   return Math.round(seconds * 1000);
 }
 
-// ---------- Subtitle helpers ----------
-const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
+function runFfmpeg(args, timeoutMs = FFMPEG_TIMEOUT_MS) {
+  return new Promise((resolve, reject) => {
+    const child = execFile(
+      "ffmpeg",
+      args,
+      { maxBuffer: 1024 * 1024 * 60 },
+      (err, stdout, stderr) => {
+        if (err) reject(new Error(stderr || err.message));
+        else resolve({ stdout, stderr });
+      }
+    );
 
+    const t = setTimeout(() => {
+      try {
+        child.kill("SIGKILL");
+      } catch {}
+      reject(new Error(`ffmpeg timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+
+    child.on("exit", () => clearTimeout(t));
+  });
+}
+
+// ASS helpers
 function msToAssTime(ms) {
   const total = Math.max(0, Math.floor(ms));
   const cs = Math.floor((total % 1000) / 10);
@@ -197,69 +203,6 @@ function wrapTwoLines(text, maxLen = 26) {
   return `${line1}\\N${line2}`;
 }
 
-function normalizeSubtitleLines(rawLines) {
-  const cleaned = (Array.isArray(rawLines) ? rawLines : [])
-    .filter((l) => typeof l?.start_ms === "number" && typeof l?.end_ms === "number" && l?.text)
-    .map((l) => ({
-      start_ms: Math.max(0, Math.floor(l.start_ms)),
-      end_ms: Math.max(0, Math.floor(l.end_ms)),
-      text: String(l.text)
-    }))
-    .sort((a, b) => a.start_ms - b.start_ms);
-
-  let prevEnd = 0;
-  const out = [];
-  for (const l of cleaned) {
-    const start = Math.max(l.start_ms, prevEnd);
-    const end = Math.max(l.end_ms, start + 200);
-    out.push({ start_ms: start, end_ms: end, text: l.text });
-    prevEnd = end;
-  }
-  return out;
-}
-
-function enforceConsecutiveWithClamp(lines, minDur = 650, maxDur = 2200) {
-  if (!Array.isArray(lines) || lines.length === 0) return [];
-  const out = [];
-  let cursor = 0;
-
-  for (const l of lines) {
-    const origDur = Math.max(1, l.end_ms - l.start_ms);
-    const dur = clamp(origDur, minDur, maxDur);
-
-    const start = cursor;
-    const end = start + dur;
-    out.push({ start_ms: start, end_ms: end, text: l.text });
-    cursor = end;
-  }
-
-  return out;
-}
-
-function proportionalFitToTarget(lines, targetMs) {
-  if (!Array.isArray(lines) || lines.length === 0) return [];
-  const lastEnd = lines[lines.length - 1].end_ms;
-  if (!lastEnd || lastEnd <= 0) return lines;
-
-  const delta = targetMs - lastEnd;
-  if (Math.abs(delta) <= 350) {
-    const out = [...lines];
-    out[out.length - 1] = { ...out[out.length - 1], end_ms: targetMs };
-    return out;
-  }
-
-  const scale = targetMs / lastEnd;
-  const scaled = lines.map((l) => ({
-    start_ms: Math.floor(l.start_ms * scale),
-    end_ms: Math.floor(l.end_ms * scale),
-    text: l.text
-  }));
-
-  const normalized = enforceConsecutiveWithClamp(scaled, 650, 2200);
-  normalized[normalized.length - 1].end_ms = targetMs;
-  return normalized;
-}
-
 function escapeDrawtext(s) {
   let t = String(s ?? "");
   t = t.replace(/\\/g, "\\\\");
@@ -270,13 +213,14 @@ function escapeDrawtext(s) {
   return t;
 }
 
-const DEJAVU_TTF = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
-
-// ---------- Main render endpoint ----------
+// -------------------- Render --------------------
 app.post("/render", upload.single("audio"), async (req, res) => {
   let workDir = null;
 
   try {
+    const startedAt = Date.now();
+    console.log("[/render] request start");
+
     if (!req.file) return res.status(400).json({ error: "Missing audio file field 'audio'." });
     if (!req.body?.payload) return res.status(400).json({ error: "Missing text field 'payload'." });
 
@@ -287,61 +231,54 @@ app.post("/render", upload.single("audio"), async (req, res) => {
       return res.status(400).json({ error: "Payload is not valid JSON." });
     }
 
-    // ---- NEW ASSETS (Option 3) ----
+    // Required assets for Option 3
     const baseBgUrl =
       payload?.assets?.base_background_url ||
       payload?.assets?.background_template_url; // backward compat
 
-    const endCardUrl = payload?.assets?.end_card_url || null;
+    const endCardUrl = payload?.assets?.end_card_url;
 
+    // Optional (ignored for now if missing / empty)
     const cardUrls = Array.isArray(payload?.assets?.card_image_urls)
       ? payload.assets.card_image_urls.filter((u) => typeof u === "string" && u.trim()).slice(0, 3)
       : [];
 
     const title = payload?.text?.title ?? "";
     const footer = payload?.text?.footer ?? "";
-    const rawLines = payload?.subtitles?.lines ?? [];
+    const rawLines = Array.isArray(payload?.subtitles?.lines) ? payload.subtitles.lines : [];
 
     if (!baseBgUrl) return res.status(400).json({ error: "payload.assets.base_background_url is required." });
     if (!endCardUrl) return res.status(400).json({ error: "payload.assets.end_card_url is required." });
-    if (!Array.isArray(rawLines)) return res.status(400).json({ error: "payload.subtitles.lines must be an array." });
 
     workDir = fs.mkdtempSync(path.join(os.tmpdir(), "mxrender-"));
-
     const audioPath = path.join(workDir, "audio.mp3");
     fs.writeFileSync(audioPath, req.file.buffer);
 
-    const publicName = `mx_${Date.now()}_${Math.random().toString(16).slice(2)}.mp4`;
-    const publicOutPath = path.join(PUBLIC_DIR, publicName);
-
-    // download/cached assets
+    // Download assets (cached)
     const baseBgFile = await getOrDownload(baseBgUrl);
     const endCardFile = await getOrDownload(endCardUrl);
-    const cardFiles = [];
-    for (const u of cardUrls) cardFiles.push(await getOrDownload(u));
 
-    // measure audio
+    // (Optional) card downloads — we will not fail if they’re missing
+    const cardFiles = [];
+    for (const u of cardUrls) {
+      try {
+        cardFiles.push(await getOrDownload(u));
+      } catch (e) {
+        console.log("[/render] card download failed:", String(e?.message || e));
+      }
+    }
+
+    // Audio duration
     let audioMs = await getAudioDurationMs(audioPath);
-    if (!audioMs) audioMs = 10000;
+    if (!audioMs) audioMs = 12000; // fallback
 
     const audioSec = (audioMs / 1000).toFixed(3);
+    const videoMs = audioMs + EXTRA_TAIL_MS;
+    const videoSec = (videoMs / 1000).toFixed(3);
+    const audioEndSec = (audioMs / 1000).toFixed(3);
 
-    // subtitles target = audio length
-    const subsTargetMs = audioMs;
-
-    // video target = audio length + 4s
-    const videoTargetMs = audioMs + EXTRA_TAIL_MS;
-    const videoTargetSec = (videoTargetMs / 1000).toFixed(3);
-
-    // ---- subtitles pipeline ----
-    let lines = normalizeSubtitleLines(rawLines);
-    lines = enforceConsecutiveWithClamp(lines, 650, 2200);
-    lines = proportionalFitToTarget(lines, subsTargetMs);
-    lines = enforceConsecutiveWithClamp(lines, 650, 2200);
-    if (lines.length) lines[lines.length - 1].end_ms = subsTargetMs;
-
+    // Build subtitles ASS (only if we got lines)
     const assPath = path.join(workDir, "subs.ass");
-
     const ASS_FONT = "DejaVu Sans";
     const SUB_FONT_SIZE = 56;
     const OUTLINE = 6;
@@ -366,7 +303,8 @@ Style: Default,${ASS_FONT},${SUB_FONT_SIZE},&H00FFFFFF,&H00FFFFFF,&H00000000,&H6
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 `;
 
-    const assEvents = lines
+    const assEvents = rawLines
+      .filter((l) => typeof l?.start_ms === "number" && typeof l?.end_ms === "number" && l?.text)
       .map((l) => {
         const start = msToAssTime(l.start_ms);
         const end = msToAssTime(l.end_ms);
@@ -376,131 +314,136 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
       })
       .join("\n");
 
-    fs.writeFileSync(assPath, assHeader + assEvents + "\n");
+    fs.writeFileSync(assPath, assHeader + (assEvents ? assEvents + "\n" : ""));
 
-    // ---- drawtext (ONLY during audio) ----
+    // Build filter_complex (SIMPLE + STABLE)
     const tTitle = escapeDrawtext(title);
     const tFooter = escapeDrawtext(footer);
 
-    const titleFilter =
+    // show title/footer only during audio (escape commas with \\,)
+    const titleDraw =
       `drawtext=fontfile=${DEJAVU_TTF}:fontsize=82:fontcolor=white:` +
       `x=(w-text_w)/2:y=220:text='${tTitle}':shadowx=0:shadowy=2:shadowcolor=black@0.35:` +
       `enable=lt(t\\,${audioSec})`;
 
-    const footerFilter =
+    const footerDraw =
       `drawtext=fontfile=${DEJAVU_TTF}:fontsize=46:fontcolor=white:` +
       `x=(w-text_w)/2:y=h-260:text='${tFooter}':shadowx=0:shadowy=2:shadowcolor=black@0.35:` +
       `enable=lt(t\\,${audioSec})`;
 
-    // ---- card overlay plan (3 segments across audio) ----
-    const seg1 = (audioMs / 1000 / 3).toFixed(3);
-    const seg2 = (audioMs / 1000 * 2 / 3).toFixed(3);
-    const audioEnd = (audioMs / 1000).toFixed(3);
-
-    const CARD_W = 820;
-    const CARD_H = 820;
-    const CARD_X = `(W-${CARD_W})/2`;
-    const CARD_Y = `560`;
+    // subtitles only during audio (ASS already ends at audio end if your chunks do)
+    const subsFilter = `subtitles=${assPath}`;
 
     // Inputs:
-    // 0: base background
-    // 1..N: cards
-    // endCardIndex: end card
-    // audioIndex: audio
-    const inputArgs = [];
-    inputArgs.push("-loop", "1", "-i", baseBgFile);
-    for (const f of cardFiles) inputArgs.push("-loop", "1", "-i", f);
-    inputArgs.push("-loop", "1", "-i", endCardFile);
-    inputArgs.push("-i", audioPath);
+    // 0 = base bg image
+    // 1 = end card image
+    // 2 = audio
+    // (cards are ignored in this “reset” version to guarantee stability; we’ll add them back once it runs)
+    const filterParts = [
+      `[0:v]scale=1080:1920,format=rgba[bg]`,
+      `[1:v]scale=1080:1920,format=rgba[end]`,
+      `[bg]${titleDraw},${footerDraw},${subsFilter}[main]`,
+      // End card only for last 4s (escape commas)
+      `[main][end]overlay=x=0:y=0:enable=between(t\\,${audioEndSec}\\,${videoSec})[vout]`
+    ];
 
-    const endCardInputIndex = 1 + cardFiles.length;
-    const audioInputIndex = endCardInputIndex + 1;
+    // IMPORTANT: join with ';' and no trailing empties
+    const filterComplex = filterParts.join(";");
 
-    // Filter graph
-    const parts = [];
-    parts.push(`[0:v]scale=1080:1920,format=rgba[base];`);
-    parts.push(`[${endCardInputIndex}:v]scale=1080:1920,format=rgba[end];`);
+    // Output path
+    const publicName = `mx_${Date.now()}_${Math.random().toString(16).slice(2)}.mp4`;
+    const publicOutPath = path.join(PUBLIC_DIR, publicName);
 
-    let current = "[base]";
-    for (let i = 0; i < cardFiles.length; i++) {
-      const inIdx = 1 + i;
-      const label = `card${i + 1}`;
-      parts.push(
-        `[${inIdx}:v]scale=${CARD_W}:${CARD_H}:force_original_aspect_ratio=cover,` +
-          `crop=${CARD_W}:${CARD_H},format=rgba[${label}];`
-      );
-
-      let enableExpr = "";
-      if (i === 0) enableExpr = `between(t\\,0\\,${seg1})`;
-      if (i === 1) enableExpr = `between(t\\,${seg1}\\,${seg2})`;
-      if (i === 2) enableExpr = `between(t\\,${seg2}\\,${audioEnd})`;
-
-      const out = `v_card_${i + 1}`;
-      parts.push(`${current}[${label}]overlay=x=${CARD_X}:y=${CARD_Y}:enable=${enableExpr}[${out}];`);
-      current = `[${out}]`;
-    }
-
-    parts.push(`${current}${titleFilter}[v_t1];`);
-    parts.push(`[v_t1]${footerFilter}[v_t2];`);
-    parts.push(`[v_t2]subtitles=${assPath}[v_sub];`);
-
-    // End card full overlay for last 4 seconds
-    parts.push(`[v_sub][end]overlay=x=0:y=0:enable=between(t\\,${audioEnd}\\,${videoTargetSec})[vout]`);
-
-    // CRITICAL: no trailing ';' at end of filter_complex
-    const filterComplex = parts.join("").replace(/;$/, "");
-
+    // Audio trim safety
     const audioFilter = `atrim=0:${audioSec},asetpts=N/SR/TB`;
 
     const args = [
       "-y",
-      ...inputArgs,
+      "-hide_banner",
+      "-loglevel",
+      "error",
+      "-nostats",
+
+      // base bg
+      "-loop",
+      "1",
+      "-i",
+      baseBgFile,
+
+      // end card
+      "-loop",
+      "1",
+      "-i",
+      endCardFile,
+
+      // audio
+      "-i",
+      audioPath,
+
       "-filter_complex",
       filterComplex,
+
       "-map",
       "[vout]",
       "-map",
-      `${audioInputIndex}:a`,
+      "2:a",
+
       "-t",
-      videoTargetSec,
+      videoSec,
       "-r",
       "30",
+      "-s",
+      "1080x1920",
       "-pix_fmt",
       "yuv420p",
       "-movflags",
       "+faststart",
+
       "-c:v",
       "libx264",
       "-preset",
       "ultrafast",
       "-crf",
       "28",
+
       "-af",
       audioFilter,
       "-c:a",
       "aac",
       "-b:a",
       "192k",
+
       publicOutPath
     ];
+
+    console.log("[/render] ffmpeg start", {
+      audio_ms: audioMs,
+      video_ms: videoMs,
+      cards_downloaded: cardFiles.length
+    });
 
     await runFfmpeg(args, FFMPEG_TIMEOUT_MS);
 
     const proto = req.get("x-forwarded-proto") || req.protocol;
     const baseUrl = `${proto}://${req.get("host")}`;
 
+    console.log("[/render] done", { ms: Date.now() - startedAt });
+
     return res.status(200).json({
       ok: true,
       download_url: `${baseUrl}/tmp/${publicName}`,
       debug: {
         audio_ms: audioMs,
-        subtitles_ms: subsTargetMs,
-        video_ms: videoTargetMs,
-        cards_used: cardFiles.length
+        video_ms: videoMs,
+        cards_downloaded: cardFiles.length
       }
     });
   } catch (e) {
-    return res.status(500).json({ error: String(e?.message || e) });
+    console.log("[/render] error", String(e?.message || e));
+    // If ffmpeg timed out, return 504 so Make stops waiting cleanly
+    const msg = String(e?.message || e);
+    const isTimeout = msg.toLowerCase().includes("timed out");
+    return res.status(isTimeout ? 504 : 500).json({ error: msg });
   } finally {
     try {
       if (workDir) fs.rmSync(workDir, { recursive: true, force: true });
