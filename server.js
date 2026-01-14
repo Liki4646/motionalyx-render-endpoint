@@ -64,7 +64,7 @@ function downloadToFile(url, outPath, timeoutMs = 20000) {
 
       if (res.statusCode !== 200) {
         res.resume();
-        reject(new Error(`Failed to download background: ${res.statusCode}`));
+        reject(new Error(`Failed to download asset: ${res.statusCode}`));
         return;
       }
 
@@ -77,23 +77,23 @@ function downloadToFile(url, outPath, timeoutMs = 20000) {
     });
 
     req.setTimeout(timeoutMs, () => {
-      req.destroy(new Error(`Background download timed out after ${timeoutMs}ms`));
+      req.destroy(new Error(`Download timed out after ${timeoutMs}ms`));
     });
 
     req.on("error", reject);
   });
 }
 
-async function getOrDownloadBackground(bgUrl) {
-  const urlObj = new URL(bgUrl);
+async function getOrDownload(url) {
+  const urlObj = new URL(url);
   const ext = path.extname(urlObj.pathname || "") || ".bin";
-  const key = sha1(bgUrl);
+  const key = sha1(url);
   const cached = path.join(CACHE_DIR, `${key}${ext}`);
 
   if (fs.existsSync(cached) && fs.statSync(cached).size > 0) return cached;
 
   const tmp = cached + ".part";
-  await downloadToFile(bgUrl, tmp, 20000);
+  await downloadToFile(url, tmp, 20000);
   fs.renameSync(tmp, cached);
   return cached;
 }
@@ -287,12 +287,25 @@ app.post("/render", upload.single("audio"), async (req, res) => {
       return res.status(400).json({ error: "Payload is not valid JSON." });
     }
 
-    const bgUrl = payload?.assets?.background_template_url;
+    // ---- NEW ASSETS (Option 3) ----
+    // Required: base background + end card
+    // Optional: 3 card images
+    const baseBgUrl =
+      payload?.assets?.base_background_url ||
+      payload?.assets?.background_template_url; // backward compat
+
+    const endCardUrl = payload?.assets?.end_card_url || null;
+
+    const cardUrls = Array.isArray(payload?.assets?.card_image_urls)
+      ? payload.assets.card_image_urls.filter(Boolean).slice(0, 3)
+      : [];
+
     const title = payload?.text?.title ?? "";
     const footer = payload?.text?.footer ?? "";
     const rawLines = payload?.subtitles?.lines ?? [];
 
-    if (!bgUrl) return res.status(400).json({ error: "payload.assets.background_template_url is required." });
+    if (!baseBgUrl) return res.status(400).json({ error: "payload.assets.base_background_url is required." });
+    if (!endCardUrl) return res.status(400).json({ error: "payload.assets.end_card_url is required." });
     if (!Array.isArray(rawLines)) return res.status(400).json({ error: "payload.subtitles.lines must be an array." });
 
     workDir = fs.mkdtempSync(path.join(os.tmpdir(), "mxrender-"));
@@ -303,12 +316,15 @@ app.post("/render", upload.single("audio"), async (req, res) => {
     const publicName = `mx_${Date.now()}_${Math.random().toString(16).slice(2)}.mp4`;
     const publicOutPath = path.join(PUBLIC_DIR, publicName);
 
-    // background cached
-    const bgFile = await getOrDownloadBackground(bgUrl);
+    // download/cached assets
+    const baseBgFile = await getOrDownload(baseBgUrl);
+    const endCardFile = await getOrDownload(endCardUrl);
+    const cardFiles = [];
+    for (const u of cardUrls) cardFiles.push(await getOrDownload(u));
 
     // measure audio
     let audioMs = await getAudioDurationMs(audioPath);
-    if (!audioMs) audioMs = 10000; // fallback if ffprobe fails
+    if (!audioMs) audioMs = 10000;
 
     const audioSec = (audioMs / 1000).toFixed(3);
 
@@ -319,14 +335,13 @@ app.post("/render", upload.single("audio"), async (req, res) => {
     const videoTargetMs = audioMs + EXTRA_TAIL_MS;
     const videoTargetSec = (videoTargetMs / 1000).toFixed(3);
 
-    // subtitles pipeline
+    // ---- subtitles pipeline (same as before) ----
     let lines = normalizeSubtitleLines(rawLines);
     lines = enforceConsecutiveWithClamp(lines, 650, 2200);
     lines = proportionalFitToTarget(lines, subsTargetMs);
     lines = enforceConsecutiveWithClamp(lines, 650, 2200);
     if (lines.length) lines[lines.length - 1].end_ms = subsTargetMs;
 
-    // build ASS
     const assPath = path.join(workDir, "subs.ass");
 
     const ASS_FONT = "DejaVu Sans";
@@ -365,35 +380,107 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
     fs.writeFileSync(assPath, assHeader + assEvents + "\n");
 
-    // title/footer
+    // ---- drawtext (ONLY during audio) ----
     const tTitle = escapeDrawtext(title);
     const tFooter = escapeDrawtext(footer);
 
     const titleFilter =
       `drawtext=fontfile=${DEJAVU_TTF}:fontsize=82:fontcolor=white:` +
-      `x=(w-text_w)/2:y=220:text='${tTitle}':shadowx=0:shadowy=2:shadowcolor=black@0.35`;
+      `x=(w-text_w)/2:y=220:text='${tTitle}':shadowx=0:shadowy=2:shadowcolor=black@0.35:` +
+      `enable='lt(t,${audioSec})'`;
 
     const footerFilter =
       `drawtext=fontfile=${DEJAVU_TTF}:fontsize=46:fontcolor=white:` +
-      `x=(w-text_w)/2:y=h-260:text='${tFooter}':shadowx=0:shadowy=2:shadowcolor=black@0.35`;
+      `x=(w-text_w)/2:y=h-260:text='${tFooter}':shadowx=0:shadowy=2:shadowcolor=black@0.35:` +
+      `enable='lt(t,${audioSec})'`;
 
-    const vf = `${titleFilter},${footerFilter},subtitles=${assPath}`;
+    // ---- card overlay plan (3 segments across audio) ----
+    // 0 -> 1/3, 1/3 -> 2/3, 2/3 -> audio end
+    const seg1 = (audioMs / 1000 / 3).toFixed(3);
+    const seg2 = (audioMs / 1000 * 2 / 3).toFixed(3);
+    const audioEnd = (audioMs / 1000).toFixed(3);
+
+    // card frame geometry (tuned for your layout + subtitles)
+    const CARD_W = 820;
+    const CARD_H = 820;
+    const CARD_X = `(W-${CARD_W})/2`;
+    const CARD_Y = `560`; // keeps clear of title and subtitles
+
+    // Build inputs:
+    // 0: base background
+    // 1..3: cards (optional)
+    // lastCardIndex: end card
+    // audio is last input
+    const inputArgs = [];
+
+    // base background
+    inputArgs.push("-loop", "1", "-i", baseBgFile);
+
+    // cards
+    for (const f of cardFiles) inputArgs.push("-loop", "1", "-i", f);
+
+    // end card
+    inputArgs.push("-loop", "1", "-i", endCardFile);
+
+    // audio
+    inputArgs.push("-i", audioPath);
+
+    const endCardInputIndex = 1 + cardFiles.length; // after bg + cards
+    const audioInputIndex = endCardInputIndex + 1;
+
+    // Filter graph
+    // Base video
+    const parts = [];
+    parts.push(`[0:v]scale=1080:1920,format=rgba[base];`);
+
+    // Prepare end card
+    parts.push(`[${endCardInputIndex}:v]scale=1080:1920,format=rgba[end];`);
+
+    // Overlay cards if provided
+    let current = "[base]";
+    for (let i = 0; i < cardFiles.length; i++) {
+      const inIdx = 1 + i;
+      const label = `card${i + 1}`;
+      parts.push(`[${inIdx}:v]scale=${CARD_W}:${CARD_H}:force_original_aspect_ratio=cover,crop=${CARD_W}:${CARD_H},format=rgba[${label}];`);
+
+      let enableExpr = "";
+      if (i === 0) enableExpr = `between(t,0,${seg1})`;
+      if (i === 1) enableExpr = `between(t,${seg1},${seg2})`;
+      if (i === 2) enableExpr = `between(t,${seg2},${audioEnd})`;
+
+      const out = `v_card_${i + 1}`;
+      parts.push(`${current}[${label}]overlay=x=${CARD_X}:y=${CARD_Y}:enable='${enableExpr}'[${out}];`);
+      current = `[${out}]`;
+    }
+
+    // Title/footer only during audio
+    parts.push(`${current}${titleFilter}[v_t1];`);
+    parts.push(`[v_t1]${footerFilter}[v_t2];`);
+
+    // Subtitles (they already end at audio end)
+    parts.push(`[v_t2]subtitles=${assPath}[v_sub];`);
+
+    // End card full overlay for last 4 seconds
+    parts.push(`[v_sub][end]overlay=x=0:y=0:enable='between(t,${audioEnd},${videoTargetSec})'[vout];`);
+
+    const filterComplex = parts.join("");
 
     // Keep audio exactly as-is (trim safety)
     const audioFilter = `atrim=0:${audioSec},asetpts=N/SR/TB`;
 
-    const isImage = /\.(png|jpg|jpeg)$/i.test(bgFile);
-
-    // Video always runs for (audio + 4s)
-    const commonVideoArgs = [
-      "-vf",
-      vf,
+    const args = [
+      "-y",
+      ...inputArgs,
+      "-filter_complex",
+      filterComplex,
+      "-map",
+      "[vout]",
+      "-map",
+      `${audioInputIndex}:a`,
       "-t",
       videoTargetSec,
       "-r",
       "30",
-      "-s",
-      "1080x1920",
       "-pix_fmt",
       "yuv420p",
       "-movflags",
@@ -409,12 +496,9 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
       "-c:a",
       "aac",
       "-b:a",
-      "192k"
+      "192k",
+      publicOutPath
     ];
-
-    const args = isImage
-      ? ["-y", "-loop", "1", "-i", bgFile, "-i", audioPath, "-tune", "stillimage", ...commonVideoArgs, publicOutPath]
-      : ["-y", "-stream_loop", "-1", "-i", bgFile, "-i", audioPath, ...commonVideoArgs, publicOutPath];
 
     await runFfmpeg(args, FFMPEG_TIMEOUT_MS);
 
@@ -427,7 +511,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
       debug: {
         audio_ms: audioMs,
         subtitles_ms: subsTargetMs,
-        video_ms: videoTargetMs
+        video_ms: videoTargetMs,
+        cards_used: cardFiles.length
       }
     });
   } catch (e) {
