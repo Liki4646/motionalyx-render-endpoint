@@ -288,8 +288,6 @@ app.post("/render", upload.single("audio"), async (req, res) => {
     }
 
     // ---- NEW ASSETS (Option 3) ----
-    // Required: base background + end card
-    // Optional: 3 card images
     const baseBgUrl =
       payload?.assets?.base_background_url ||
       payload?.assets?.background_template_url; // backward compat
@@ -297,7 +295,7 @@ app.post("/render", upload.single("audio"), async (req, res) => {
     const endCardUrl = payload?.assets?.end_card_url || null;
 
     const cardUrls = Array.isArray(payload?.assets?.card_image_urls)
-      ? payload.assets.card_image_urls.filter(Boolean).slice(0, 3)
+      ? payload.assets.card_image_urls.filter((u) => typeof u === "string" && u.trim()).slice(0, 3)
       : [];
 
     const title = payload?.text?.title ?? "";
@@ -335,7 +333,7 @@ app.post("/render", upload.single("audio"), async (req, res) => {
     const videoTargetMs = audioMs + EXTRA_TAIL_MS;
     const videoTargetSec = (videoTargetMs / 1000).toFixed(3);
 
-    // ---- subtitles pipeline (same as before) ----
+    // ---- subtitles pipeline ----
     let lines = normalizeSubtitleLines(rawLines);
     lines = enforceConsecutiveWithClamp(lines, 650, 2200);
     lines = proportionalFitToTarget(lines, subsTargetMs);
@@ -384,18 +382,18 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     const tTitle = escapeDrawtext(title);
     const tFooter = escapeDrawtext(footer);
 
+    // IMPORTANT: escape commas in enable expressions for ffmpeg
     const titleFilter =
       `drawtext=fontfile=${DEJAVU_TTF}:fontsize=82:fontcolor=white:` +
       `x=(w-text_w)/2:y=220:text='${tTitle}':shadowx=0:shadowy=2:shadowcolor=black@0.35:` +
-      `enable='lt(t,${audioSec})'`;
+      `enable=lt(t\\,${audioSec})`;
 
     const footerFilter =
       `drawtext=fontfile=${DEJAVU_TTF}:fontsize=46:fontcolor=white:` +
       `x=(w-text_w)/2:y=h-260:text='${tFooter}':shadowx=0:shadowy=2:shadowcolor=black@0.35:` +
-      `enable='lt(t,${audioSec})'`;
+      `enable=lt(t\\,${audioSec})`;
 
     // ---- card overlay plan (3 segments across audio) ----
-    // 0 -> 1/3, 1/3 -> 2/3, 2/3 -> audio end
     const seg1 = (audioMs / 1000 / 3).toFixed(3);
     const seg2 = (audioMs / 1000 * 2 / 3).toFixed(3);
     const audioEnd = (audioMs / 1000).toFixed(3);
@@ -404,32 +402,27 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     const CARD_W = 820;
     const CARD_H = 820;
     const CARD_X = `(W-${CARD_W})/2`;
-    const CARD_Y = `560`; // keeps clear of title and subtitles
+    const CARD_Y = `560`;
 
     // Build inputs:
     // 0: base background
-    // 1..3: cards (optional)
-    // lastCardIndex: end card
-    // audio is last input
+    // 1..N: cards
+    // endCardIndex: end card
+    // audioIndex: audio
     const inputArgs = [];
 
-    // base background
     inputArgs.push("-loop", "1", "-i", baseBgFile);
 
-    // cards
     for (const f of cardFiles) inputArgs.push("-loop", "1", "-i", f);
 
-    // end card
     inputArgs.push("-loop", "1", "-i", endCardFile);
 
-    // audio
     inputArgs.push("-i", audioPath);
 
-    const endCardInputIndex = 1 + cardFiles.length; // after bg + cards
+    const endCardInputIndex = 1 + cardFiles.length;
     const audioInputIndex = endCardInputIndex + 1;
 
     // Filter graph
-    // Base video
     const parts = [];
     parts.push(`[0:v]scale=1080:1920,format=rgba[base];`);
 
@@ -441,15 +434,20 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     for (let i = 0; i < cardFiles.length; i++) {
       const inIdx = 1 + i;
       const label = `card${i + 1}`;
-      parts.push(`[${inIdx}:v]scale=${CARD_W}:${CARD_H}:force_original_aspect_ratio=cover,crop=${CARD_W}:${CARD_H},format=rgba[${label}];`);
+      parts.push(
+        `[${inIdx}:v]scale=${CARD_W}:${CARD_H}:force_original_aspect_ratio=cover,` +
+          `crop=${CARD_W}:${CARD_H},format=rgba[${label}];`
+      );
 
       let enableExpr = "";
-      if (i === 0) enableExpr = `between(t,0,${seg1})`;
-      if (i === 1) enableExpr = `between(t,${seg1},${seg2})`;
-      if (i === 2) enableExpr = `between(t,${seg2},${audioEnd})`;
+      if (i === 0) enableExpr = `between(t\\,0\\,${seg1})`;
+      if (i === 1) enableExpr = `between(t\\,${seg1}\\,${seg2})`;
+      if (i === 2) enableExpr = `between(t\\,${seg2}\\,${audioEnd})`;
 
       const out = `v_card_${i + 1}`;
-      parts.push(`${current}[${label}]overlay=x=${CARD_X}:y=${CARD_Y}:enable='${enableExpr}'[${out}];`);
+      parts.push(
+        `${current}[${label}]overlay=x=${CARD_X}:y=${CARD_Y}:enable=${enableExpr}[${out}];`
+      );
       current = `[${out}]`;
     }
 
@@ -457,11 +455,13 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     parts.push(`${current}${titleFilter}[v_t1];`);
     parts.push(`[v_t1]${footerFilter}[v_t2];`);
 
-    // Subtitles (they already end at audio end)
+    // Subtitles end at audio end
     parts.push(`[v_t2]subtitles=${assPath}[v_sub];`);
 
     // End card full overlay for last 4 seconds
-    parts.push(`[v_sub][end]overlay=x=0:y=0:enable='between(t,${audioEnd},${videoTargetSec})'[vout];`);
+    parts.push(
+      `[v_sub][end]overlay=x=0:y=0:enable=between(t\\,${audioEnd}\\,${videoTargetSec})[vout];`
+    );
 
     const filterComplex = parts.join("");
 
