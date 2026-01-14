@@ -1,11 +1,11 @@
-import express from "express";
-import multer from "multer";
-import { execFile } from "child_process";
-import fs from "fs";
-import path from "path";
-import os from "os";
-import https from "https";
-import http from "http";
+const express = require("express");
+const multer = require("multer");
+const { execFile } = require("child_process");
+const fs = require("fs");
+const path = require("path");
+const os = require("os");
+const https = require("https");
+const http = require("http");
 
 const app = express();
 app.set("trust proxy", 1);
@@ -63,7 +63,7 @@ function runFfmpeg(args) {
 app.post("/render", upload.single("audio"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "Missing audio file field 'audio'." });
-    if (!req.body?.payload) return res.status(400).json({ error: "Missing text field 'payload'." });
+    if (!req.body || !req.body.payload) return res.status(400).json({ error: "Missing text field 'payload'." });
 
     let payload;
     try {
@@ -145,43 +145,21 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
     // Faster encoding to reduce timeouts on small instances
     const commonVideoArgs = [
-      "-c:v",
-      "libx264",
-      "-preset",
-      "ultrafast",
-      "-crf",
-      "28",
-      "-movflags",
-      "+faststart",
-      "-pix_fmt",
-      "yuv420p",
-      "-vf",
-      vf,
+      "-c:v", "libx264",
+      "-preset", "ultrafast",
+      "-crf", "28",
+      "-movflags", "+faststart",
+      "-pix_fmt", "yuv420p",
+      "-vf", vf,
       "-shortest",
-      "-r",
-      "30",
-      "-s",
-      "1080x1920",
-      "-c:a",
-      "aac",
-      "-b:a",
-      "192k"
+      "-r", "30",
+      "-s", "1080x1920",
+      "-c:a", "aac",
+      "-b:a", "192k"
     ];
 
     const args = isImage
-      ? [
-          "-y",
-          "-loop",
-          "1",
-          "-i",
-          bgFile,
-          "-i",
-          audioPath,
-          "-tune",
-          "stillimage",
-          ...commonVideoArgs,
-          publicOutPath
-        ]
+      ? ["-y", "-loop", "1", "-i", bgFile, "-i", audioPath, "-tune", "stillimage", ...commonVideoArgs, publicOutPath]
       : ["-y", "-i", bgFile, "-i", audioPath, ...commonVideoArgs, publicOutPath];
 
     await runFfmpeg(args);
