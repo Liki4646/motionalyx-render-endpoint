@@ -8,6 +8,14 @@ import https from "https";
 import http from "http";
 
 const app = express();
+app.set("trust proxy", 1);
+
+const PUBLIC_DIR = path.join(os.tmpdir(), "mxpublic");
+fs.mkdirSync(PUBLIC_DIR, { recursive: true });
+
+// Serve rendered files from a public temp folder
+app.use("/tmp", express.static(PUBLIC_DIR));
+
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 25 * 1024 * 1024 } // 25MB
@@ -20,6 +28,12 @@ function downloadToFile(url, outPath) {
   return new Promise((resolve, reject) => {
     const client = url.startsWith("https") ? https : http;
     const req = client.get(url, (res) => {
+      // Handle redirects (common on CDNs)
+      if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        res.resume();
+        return downloadToFile(res.headers.location, outPath).then(resolve).catch(reject);
+      }
+
       if (res.statusCode !== 200) {
         reject(new Error(`Failed to download background: ${res.statusCode}`));
         res.resume();
@@ -69,7 +83,10 @@ app.post("/render", upload.single("audio"), async (req, res) => {
     // Temp working dir
     const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "mxrender-"));
     const audioPath = path.join(workDir, "audio.mp3");
-    const outPath = path.join(workDir, "out.mp4");
+
+    // Public output (so we return a download URL instead of streaming binary)
+    const publicName = `mx_${Date.now()}_${Math.random().toString(16).slice(2)}.mp4`;
+    const publicOutPath = path.join(PUBLIC_DIR, publicName);
 
     fs.writeFileSync(audioPath, req.file.buffer);
 
@@ -107,8 +124,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     };
 
     const assEvents = lines
-      .filter(l => typeof l?.start_ms === "number" && typeof l?.end_ms === "number" && l?.text)
-      .map(l => {
+      .filter((l) => typeof l?.start_ms === "number" && typeof l?.end_ms === "number" && l?.text)
+      .map((l) => {
         const start = msToAssTime(l.start_ms);
         const end = msToAssTime(l.end_ms);
         const text = safe(l.text);
@@ -126,47 +143,58 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     const vf = `${titleFilter},${footerFilter},subtitles=${assPath}`;
     const isImage = /\.(png|jpg|jpeg)$/i.test(bgFile);
 
+    // Faster encoding to reduce timeouts on small instances
+    const commonVideoArgs = [
+      "-c:v",
+      "libx264",
+      "-preset",
+      "ultrafast",
+      "-crf",
+      "28",
+      "-movflags",
+      "+faststart",
+      "-pix_fmt",
+      "yuv420p",
+      "-vf",
+      vf,
+      "-shortest",
+      "-r",
+      "30",
+      "-s",
+      "1080x1920",
+      "-c:a",
+      "aac",
+      "-b:a",
+      "192k"
+    ];
+
     const args = isImage
       ? [
           "-y",
-          "-loop", "1",
-          "-i", bgFile,
-          "-i", audioPath,
-          "-tune", "stillimage",
-          "-c:v", "libx264",
-          "-pix_fmt", "yuv420p",
-          "-vf", vf,
-          "-shortest",
-          "-r", "30",
-          "-s", "1080x1920",
-          "-c:a", "aac",
-          "-b:a", "192k",
-          outPath
+          "-loop",
+          "1",
+          "-i",
+          bgFile,
+          "-i",
+          audioPath,
+          "-tune",
+          "stillimage",
+          ...commonVideoArgs,
+          publicOutPath
         ]
-      : [
-          "-y",
-          "-i", bgFile,
-          "-i", audioPath,
-          "-c:v", "libx264",
-          "-pix_fmt", "yuv420p",
-          "-vf", vf,
-          "-shortest",
-          "-r", "30",
-          "-s", "1080x1920",
-          "-c:a", "aac",
-          "-b:a", "192k",
-          outPath
-        ];
+      : ["-y", "-i", bgFile, "-i", audioPath, ...commonVideoArgs, publicOutPath];
 
     await runFfmpeg(args);
 
-    const stat = fs.statSync(outPath);
-    res.setHeader("Content-Type", "video/mp4");
-    res.setHeader("Content-Length", stat.size);
-    res.setHeader("Content-Disposition", "inline; filename=motionalyx.mp4");
-    fs.createReadStream(outPath).pipe(res);
+    const proto = req.get("x-forwarded-proto") || req.protocol;
+    const baseUrl = `${proto}://${req.get("host")}`;
+
+    return res.status(200).json({
+      ok: true,
+      download_url: `${baseUrl}/tmp/${publicName}`
+    });
   } catch (e) {
-    res.status(500).json({ error: String(e?.message || e) });
+    return res.status(500).json({ error: String(e?.message || e) });
   }
 });
 
