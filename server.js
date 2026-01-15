@@ -1,713 +1,258 @@
-// server.js (Node 20, ES modules)
-// Motionalyx Render Endpoint — Diagnostic build
-//
-// Goals:
-// - Show if ffmpeg is slow (free plan CPU) vs. stuck (hang)
-// - Log ffmpeg progress (out_time_ms, speed, fps) every few seconds
-// - Keep same API contract: GET /, GET /health, POST /render multipart
-//
-// POST /render expects:
-//  - multipart file field: audio (mp3)
-//  - text field: payload (JSON string)
-//
-// payload schema (as you described) + optional:
-//  payload.debug.disable_subtitles: true   -> skip ASS burn-in for A/B test
-//
-// Output JSON:
-// {
-//   ok: true,
-//   download_url,
-//   debug: { audio_ms, video_ms, elapsed_ms, ffmpeg_last, ffmpeg_samples }
-// }
+'use strict';
 
-import express from "express";
-import multer from "multer";
-import crypto from "crypto";
-import path from "path";
-import fs from "fs";
-import fsp from "fs/promises";
-import { spawn } from "child_process";
+const express = require('express');
+const multer = require('multer');
+const fs = require('fs');
+const fsp = require('fs/promises');
+const path = require('path');
+const crypto = require('crypto');
+const { spawn } = require('child_process');
 
 const app = express();
-app.set("trust proxy", 1);
 
-// ---------- Paths ----------
-const TMP_ROOT = "/tmp";
-const CACHE_DIR = path.join(TMP_ROOT, "mxcache");
-const PUBLIC_DIR = path.join(TMP_ROOT, "mxpublic");
-const WORK_DIR = path.join(TMP_ROOT, "mxwork");
-const UPLOAD_DIR = path.join(TMP_ROOT, "mxuploads");
-
-// Docker installs fonts-dejavu-core
-const FONT_FILE = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
-
-// ---------- Ensure dirs ----------
-async function ensureDirs() {
-  await fsp.mkdir(CACHE_DIR, { recursive: true });
-  await fsp.mkdir(PUBLIC_DIR, { recursive: true });
-  await fsp.mkdir(WORK_DIR, { recursive: true });
-  await fsp.mkdir(UPLOAD_DIR, { recursive: true });
-}
-await ensureDirs();
-
-// ---------- Static serving ----------
-app.use(
-  "/tmp",
-  express.static(PUBLIC_DIR, {
-    fallthrough: false,
-    setHeaders(res) {
-      res.setHeader("Cache-Control", "no-store");
-    },
-  })
-);
-
-// ---------- Health ----------
-app.get("/", (_req, res) => res.type("text/plain").send("ok"));
-app.get("/health", (_req, res) => res.json({ ok: true }));
-
-// ---------- Multer ----------
-const storage = multer.diskStorage({
-  destination: (_req, _file, cb) => cb(null, UPLOAD_DIR),
-  filename: (_req, file, cb) => {
-    const id = crypto.randomBytes(16).toString("hex");
-    const ext = path.extname(file.originalname || "").toLowerCase() || ".mp3";
-    cb(null, `${id}${ext}`);
+// --- Multer: multipart/form-data (audio file + payload text) ---
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 50 * 1024 * 1024, // 50MB
   },
 });
-const upload = multer({
-  storage,
-  limits: { fileSize: 25 * 1024 * 1024, files: 1, fields: 50 },
-});
 
-// ---------- Single render lock ----------
-let renderBusy = false;
+const PORT = process.env.PORT || 3000;
 
-// ---------- Utils ----------
-function nowIso() {
-  return new Date().toISOString();
-}
-function log(reqId, msg, extra) {
-  if (extra !== undefined) console.log(`${nowIso()} [${reqId}] ${msg}`, extra);
-  else console.log(`${nowIso()} [${reqId}] ${msg}`);
-}
-function sha1(str) {
-  return crypto.createHash("sha1").update(str).digest("hex");
-}
-async function exists(p) {
-  try {
-    await fsp.access(p);
-    return true;
-  } catch {
-    return false;
-  }
-}
-async function findExistingCached(filePathBase) {
-  const exts = [".png", ".jpg", ".jpeg", ".webp", ".bin"];
-  for (const ext of exts) {
-    const p = `${filePathBase}${ext}`;
-    if (await exists(p)) return p;
-  }
-  if (await exists(filePathBase)) return filePathBase;
-  return null;
-}
-function safeJsonParse(str) {
-  try {
-    return { ok: true, value: JSON.parse(str) };
-  } catch (e) {
-    return { ok: false, error: e };
-  }
-}
-
-// ---------- Download + cache ----------
-async function downloadToCache(url, { timeoutMs = 20000 } = {}) {
-  if (!url || typeof url !== "string") throw new Error("Missing asset URL");
-
-  const key = sha1(url);
-  const base = path.join(CACHE_DIR, key);
-
-  const existing = await findExistingCached(base);
-  if (existing) return existing;
-
-  const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), timeoutMs);
-
-  let res;
-  try {
-    res = await fetch(url, {
-      redirect: "follow",
-      signal: controller.signal,
-      headers: {
-        "User-Agent": "motionalyx-render-endpoint/diagnostic",
-        Accept: "*/*",
-      },
-    });
-  } finally {
-    clearTimeout(t);
-  }
-
-  if (!res?.ok) {
-    throw new Error(`Failed to download asset: ${res?.status ?? "NO"} ${res?.statusText ?? ""}`.trim());
-  }
-
-  const contentType = (res.headers.get("content-type") || "").toLowerCase();
-  let ext = "";
-  if (contentType.includes("png")) ext = ".png";
-  else if (contentType.includes("jpeg") || contentType.includes("jpg")) ext = ".jpg";
-  else if (contentType.includes("webp")) ext = ".webp";
-  else {
-    const uext = path.extname(new URL(url).pathname).toLowerCase();
-    ext = uext || ".bin";
-  }
-
-  const outPath = `${base}${ext}`;
-  const buf = Buffer.from(await res.arrayBuffer());
-  await fsp.writeFile(outPath, buf);
-  return outPath;
-}
-
-// ---------- ffprobe ----------
-async function spawnSimple(cmd, args, { timeoutMs = 15000, reqId = "na", prefix = "" } = {}) {
+// ---- Helpers ----
+function run(cmd, args, { timeoutMs = 10 * 60 * 1000 } = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
-    let out = "";
-    let err = "";
+    const child = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    let out = '';
+    let err = '';
 
     const t = setTimeout(() => {
-      try { child.kill("SIGKILL"); } catch {}
-      const e = new Error(`${cmd} timeout after ${timeoutMs}ms`);
-      e.code = "ETIMEDOUT";
-      reject(e);
+      try { child.kill('SIGKILL'); } catch {}
+      reject(new Error(`Timeout running: ${cmd} ${args.join(' ')}`));
     }, timeoutMs);
 
-    child.stdout.on("data", (d) => (out += d.toString()));
-    child.stderr.on("data", (d) => {
-      const s = d.toString();
-      err += s;
-      const lines = s.split("\n").map(x => x.trim()).filter(Boolean);
-      for (const line of lines) log(reqId, `${prefix}stderr: ${line.slice(0, 500)}`);
+    child.stdout.on('data', (d) => (out += d.toString()));
+    child.stderr.on('data', (d) => (err += d.toString()));
+
+    child.on('error', (e) => {
+      clearTimeout(t);
+      reject(e);
     });
 
-    child.on("error", (e) => {
+    child.on('close', (code) => {
       clearTimeout(t);
-      reject(e);
-    });
-    child.on("close", (code) => {
-      clearTimeout(t);
-      if (code === 0) return resolve({ stdout: out, stderr: err });
-      const e = new Error(`${cmd} exited with code ${code}`);
-      e.code = code;
-      e.stderr = err;
-      reject(e);
+      if (code === 0) return resolve({ out, err });
+      reject(new Error(`Command failed (${code}): ${cmd} ${args.join(' ')}\n${err}`));
     });
   });
 }
 
-async function ffprobeDurationMs(audioPath, { reqId } = {}) {
+async function ffprobeDurationSeconds(filePath) {
+  // returns duration as number (seconds)
   const args = [
-    "-v", "error",
-    "-show_entries", "format=duration",
-    "-of", "default=noprint_wrappers=1:nokey=1",
-    audioPath,
+    '-v', 'error',
+    '-show_entries', 'format=duration',
+    '-of', 'default=noprint_wrappers=1:nokey=1',
+    filePath
   ];
-  const { stdout } = await spawnSimple("ffprobe", args, { timeoutMs: 15000, reqId, prefix: "[ffprobe] " });
-  const sec = Number(String(stdout).trim());
-  if (!Number.isFinite(sec) || sec <= 0) throw new Error(`Invalid ffprobe duration: "${stdout}"`);
-  return Math.round(sec * 1000);
+  const { out } = await run('ffprobe', args, { timeoutMs: 60_000 });
+  const v = parseFloat((out || '').trim());
+  if (!Number.isFinite(v)) throw new Error('ffprobe could not read duration');
+  return v;
 }
 
-// ---------- ASS subtitles ----------
-function wrapSubtitle(text, maxChars = 26, maxLines = 2) {
-  const raw = String(text ?? "").trim().replace(/\s+/g, " ");
-  if (!raw) return "";
-  if (raw.length <= maxChars) return raw;
-
-  const words = raw.split(" ");
-  const lines = [];
-  let cur = "";
-
-  for (const w of words) {
-    if (!cur) { cur = w; continue; }
-    if ((cur + " " + w).length <= maxChars) cur += " " + w;
-    else {
-      lines.push(cur);
-      cur = w;
-      if (lines.length === maxLines) break;
-    }
-  }
-  if (lines.length < maxLines && cur) lines.push(cur);
-  return lines.slice(0, maxLines).join("\\N");
+async function downloadToFile(url, destPath) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Download failed ${res.status} for ${url}`);
+  const buf = Buffer.from(await res.arrayBuffer());
+  await fsp.writeFile(destPath, buf);
+  return destPath;
 }
 
-function msToAssTime(ms) {
-  const total = Math.max(0, Math.round(ms));
-  const cs = Math.floor((total % 1000) / 10);
-  const s = Math.floor(total / 1000) % 60;
-  const m = Math.floor(total / 60000) % 60;
-  const h = Math.floor(total / 3600000);
-  const pad2 = (n) => String(n).padStart(2, "0");
-  return `${h}:${pad2(m)}:${pad2(s)}.${pad2(cs)}`;
+function safeJsonParse(str) {
+  try { return JSON.parse(str); } catch { return null; }
 }
 
-function scaleSubtitleLinesToAudio(lines, audioMs) {
-  if (!Array.isArray(lines) || lines.length === 0) return [];
-  const lastEnd = Number(lines[lines.length - 1]?.end_ms);
-  if (!Number.isFinite(lastEnd) || lastEnd <= 0) return lines;
-
-  const delta = Math.abs(lastEnd - audioMs);
-  if (delta <= 50) {
-    const out = lines.map((l) => ({ ...l }));
-    out[out.length - 1].end_ms = audioMs;
-    return out;
-  }
-
-  const factor = audioMs / lastEnd;
-  const out = lines.map((l) => ({
-    start_ms: Math.round(Number(l.start_ms) * factor),
-    end_ms: Math.round(Number(l.end_ms) * factor),
-    text: String(l.text ?? ""),
-  }));
-
-  out[0].start_ms = 0;
-  for (let i = 1; i < out.length; i++) out[i].start_ms = out[i - 1].end_ms;
-  out[out.length - 1].end_ms = audioMs;
-
-  return out;
+function tmpName(prefix, ext) {
+  return path.join('/tmp', `${prefix}-${crypto.randomBytes(6).toString('hex')}${ext}`);
 }
 
-async function writeAssFile(lines, outPath) {
-  const header = [
-    "[Script Info]",
-    "ScriptType: v4.00+",
-    "PlayResX: 1080",
-    "PlayResY: 1920",
-    "WrapStyle: 0",
-    "ScaledBorderAndShadow: yes",
-    "YCbCr Matrix: TV.709",
-    "",
-    "[V4+ Styles]",
-    "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
-    "Style: Default,DejaVu Sans,56,&H00FFFFFF,&H000000FF,&H00000000,&H64000000,0,0,0,0,100,100,0,0,1,3,1,2,60,60,160,1",
-    "",
-    "[Events]",
-    "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
-  ].join("\n");
+// ---- Routes ----
 
-  const events = [];
-  for (const l of lines) {
-    const start = msToAssTime(l.start_ms);
-    const end = msToAssTime(l.end_ms);
-    const wrapped = wrapSubtitle(l.text, 26, 2);
-    const safe = wrapped.replace(/{/g, "\\{").replace(/}/g, "\\}");
-    events.push(`Dialogue: 0,${start},${end},Default,,0,0,0,,${safe}`);
-  }
+// Health check
+app.get('/', (req, res) => res.status(200).send('ok'));
+app.get('/health', (req, res) => res.status(200).json({ ok: true }));
 
-  await fsp.writeFile(outPath, `${header}\n${events.join("\n")}\n`, "utf8");
-}
-
-// ---------- drawtext escape ----------
-function escapeDrawtextText(input) {
-  return String(input ?? "")
-    .replace(/\\/g, "\\\\")
-    .replace(/:/g, "\\:")
-    .replace(/'/g, "\\'")
-    .replace(/%/g, "\\%")
-    .replace(/\r\n|\r|\n/g, "\\n");
-}
-
-// ---------- filtergraph builder ----------
-function buildFilterComplex({ assPath, title, footer, audioSec, videoSec, disableSubtitles }) {
-  const filters = [];
-
-  let baseLabel = "[0:v]";
-  if (!disableSubtitles) {
-    const assEsc = assPath.replace(/\\/g, "\\\\").replace(/:/g, "\\:");
-    filters.push(`[0:v]subtitles='${assEsc}'[v0]`);
-    baseLabel = "[v0]";
-  } else {
-    filters.push(`[0:v]null[v0]`);
-    baseLabel = "[v0]";
-  }
-
-  const tText = escapeDrawtextText(title);
-  const fText = escapeDrawtextText(footer);
-
-  const enableAudioOnly = `lt(t\\,${audioSec.toFixed(3)})`;
-  filters.push(
-    `${baseLabel}drawtext=fontfile=${FONT_FILE}:text='${tText}':fontsize=78:fontcolor=white:x=(w-text_w)/2:y=320:shadowcolor=black:shadowx=2:shadowy=2:enable='${enableAudioOnly}'[v1]`
-  );
-  filters.push(
-    `[v1]drawtext=fontfile=${FONT_FILE}:text='${fText}':fontsize=54:fontcolor=white:x=(w-text_w)/2:y=1520:shadowcolor=black:shadowx=2:shadowy=2:enable='${enableAudioOnly}'[v2]`
-  );
-
-  const enableEndCard = `between(t\\,${audioSec.toFixed(3)}\\,${videoSec.toFixed(3)})`;
-  filters.push(`[v2][2:v]overlay=0:0:enable='${enableEndCard}'[vout]`);
-
-  // no trailing ;
-  return filters.join(";");
-}
-
-// ---------- payload validation ----------
-function validatePayload(payload) {
-  if (!payload || typeof payload !== "object") throw new Error("payload must be an object");
-
-  const spec = payload.spec || {};
-  const assets = payload.assets || {};
-  const text = payload.text || {};
-  const subtitles = payload.subtitles || {};
-
-  const width = Number(spec.width ?? 1080);
-  const height = Number(spec.height ?? 1920);
-  const fps = Number(spec.fps ?? 30);
-
-  if (!Number.isFinite(width) || !Number.isFinite(height) || !Number.isFinite(fps)) {
-    throw new Error("Invalid spec (width/height/fps)");
-  }
-
-  if (!assets.base_background_url) throw new Error("Missing assets.base_background_url");
-  if (!assets.end_card_url) throw new Error("Missing assets.end_card_url");
-
-  const lines = Array.isArray(subtitles.lines) ? subtitles.lines : [];
-  if (lines.length === 0) throw new Error("Missing subtitles.lines");
-
-  const debug = payload.debug && typeof payload.debug === "object" ? payload.debug : {};
-  const disableSubtitles = debug.disable_subtitles === true;
-
-  return {
-    spec: { width, height, fps },
-    assets: {
-      base_background_url: String(assets.base_background_url),
-      end_card_url: String(assets.end_card_url),
-    },
-    text: {
-      title: String(text.title ?? "").trim(),
-      footer: String(text.footer ?? "").trim(),
-    },
-    subtitles: { lines },
-    debug: { disableSubtitles },
-  };
-}
-
-// ---------- ffmpeg runner with progress parsing ----------
-function runFfmpegWithProgress({ reqId, args, timeoutMs, hardTimeoutMs }) {
-  return new Promise((resolve, reject) => {
-    const child = spawn("ffmpeg", args, { stdio: ["ignore", "ignore", "pipe"] });
-
-    const started = Date.now();
-    let killed = false;
-
-    // ffmpeg -progress pipe:2 outputs key=value lines; progress=end at the end
-    const last = {
-      out_time_ms: 0,
-      out_time: "",
-      speed: "",
-      fps: "",
-      frame: "",
-      progress: "",
-    };
-
-    const samples = []; // store a few samples for response (not too big)
-
-    // heartbeat: log every 5 seconds
-    const hb = setInterval(() => {
-      const elapsed = Date.now() - started;
-      log(reqId, `[ffmpeg] heartbeat elapsed_ms=${elapsed} out_time_ms=${last.out_time_ms} speed=${last.speed} fps=${last.fps} frame=${last.frame}`);
-    }, 5000);
-
-    const softTimer = setTimeout(() => {
-      if (killed) return;
-      killed = true;
-      try { child.kill("SIGKILL"); } catch {}
-      const e = new Error(`ffmpeg timeout after ${timeoutMs}ms`);
-      e.code = "ETIMEDOUT";
-      e.ffmpeg_last = { ...last };
-      e.ffmpeg_samples = samples.slice(-20);
-      reject(e);
-    }, timeoutMs);
-
-    const hardTimer = setTimeout(() => {
-      if (killed) return;
-      killed = true;
-      try { child.kill("SIGKILL"); } catch {}
-      const e = new Error(`ffmpeg HARD timeout after ${hardTimeoutMs}ms`);
-      e.code = "HARD_TIMEOUT";
-      e.ffmpeg_last = { ...last };
-      e.ffmpeg_samples = samples.slice(-20);
-      reject(e);
-    }, hardTimeoutMs);
-
-    let buf = "";
-    child.stderr.on("data", (d) => {
-      buf += d.toString();
-      let idx;
-      while ((idx = buf.indexOf("\n")) >= 0) {
-        const line = buf.slice(0, idx).trim();
-        buf = buf.slice(idx + 1);
-
-        if (!line) continue;
-
-        // progress format: key=value
-        const eq = line.indexOf("=");
-        if (eq > 0) {
-          const key = line.slice(0, eq).trim();
-          const val = line.slice(eq + 1).trim();
-
-          if (key in last) {
-            last[key] = val;
-            if (key === "out_time_ms") {
-              const n = Number(val);
-              if (Number.isFinite(n)) last.out_time_ms = n;
-            }
-          }
-
-          if (key === "progress") {
-            last.progress = val;
-            // store small sample
-            samples.push({
-              t_ms: Date.now() - started,
-              out_time_ms: last.out_time_ms,
-              speed: last.speed,
-              fps: last.fps,
-              frame: last.frame,
-              progress: val,
-            });
-            if (samples.length > 60) samples.shift(); // keep last 60 only
-          }
-        } else {
-          // other stderr lines, log as warning (trim)
-          log(reqId, `[ffmpeg] ${line.slice(0, 500)}`);
-        }
-      }
-    });
-
-    child.on("error", (err) => {
-      clearInterval(hb);
-      clearTimeout(softTimer);
-      clearTimeout(hardTimer);
-      reject(err);
-    });
-
-    child.on("close", (code) => {
-      clearInterval(hb);
-      clearTimeout(softTimer);
-      clearTimeout(hardTimer);
-
-      if (code === 0) {
-        return resolve({
-          ffmpeg_last: { ...last },
-          ffmpeg_samples: samples.slice(-20),
-          elapsed_ms: Date.now() - started,
-        });
-      }
-
-      const e = new Error(`ffmpeg exited with code ${code}`);
-      e.code = code;
-      e.ffmpeg_last = { ...last };
-      e.ffmpeg_samples = samples.slice(-20);
-      reject(e);
-    });
-  });
-}
-
-// ---------- POST /render ----------
-app.post("/render", upload.single("audio"), async (req, res) => {
-  const reqId = crypto.randomBytes(6).toString("hex");
+/**
+ * POST /
+ * multipart/form-data:
+ *  - audio: File
+ *  - payload: Text (JSON string)
+ *
+ * Payload supported (optional):
+ *  - background_video_url: string  (if provided -> we render mp4)
+ *  - subtitles_srt: string         (optional; burned in)
+ *  - extra_tail_seconds: number    (default 4)
+ *  - response_mode: "json" | "binary" (default "json")
+ */
+app.post('/', upload.single('audio'), async (req, res) => {
   const startedAt = Date.now();
 
-  if (renderBusy) return res.status(503).json({ ok: false, error: "Renderer busy. Try again." });
-  renderBusy = true;
-
-  log(reqId, "[/render] request start");
-
-  // Make timeout is 300s; start with these, and you can override via env vars
-  const FFMPEG_TIMEOUT_MS = Number(process.env.FFMPEG_TIMEOUT_MS || 285000); // close to 300s
-  const HARD_TIMEOUT_MS = Number(process.env.HARD_TIMEOUT_MS || 295000);
-
-  let audioPath = null;
-  let assPath = null;
-
   try {
-    if (!req.file?.path) return res.status(400).json({ ok: false, error: "Missing multipart file field: audio" });
-    audioPath = req.file.path;
-
-    const payloadStr = req.body?.payload;
-    if (!payloadStr || typeof payloadStr !== "string") {
-      return res.status(400).json({ ok: false, error: "Missing text field: payload (JSON string)" });
+    // Validate multipart fields
+    if (!req.file) {
+      return res.status(400).json({ ok: false, error: 'Missing form-data file field: audio' });
     }
+    const payloadRaw = (req.body && req.body.payload) ? String(req.body.payload) : '';
+    const payload = safeJsonParse(payloadRaw);
 
-    const parsed = safeJsonParse(payloadStr);
-    if (!parsed.ok) return res.status(400).json({ ok: false, error: "Invalid JSON in payload" });
-
-    const payload = validatePayload(parsed.value);
-
-    // download assets
-    const baseBgPath = await downloadToCache(payload.assets.base_background_url);
-    const endCardPath = await downloadToCache(payload.assets.end_card_url);
-
-    // audio duration
-    const audioMs = await ffprobeDurationMs(audioPath, { reqId });
-    const audioSec = audioMs / 1000;
-    const videoSec = audioSec + 4.0;
-    const videoMs = Math.round(videoSec * 1000);
-
-    // subtitles (scale to audio) + write ASS (unless disabled)
-    const jobId = crypto.randomBytes(12).toString("hex");
-    assPath = path.join(WORK_DIR, `${jobId}.ass`);
-
-    const scaledLines = scaleSubtitleLinesToAudio(payload.subtitles.lines, audioMs);
-    if (!payload.debug.disableSubtitles) {
-      await writeAssFile(scaledLines, assPath);
-    } else {
-      // still create empty file path reference? not needed; filter builder will ignore
-      await fsp.writeFile(assPath, "", "utf8");
-      log(reqId, "[/render] debug: subtitles DISABLED for A/B test");
-    }
-
-    // output
-    const outName = `${jobId}.mp4`;
-    const outPath = path.join(PUBLIC_DIR, outName);
-
-    const fps = payload.spec.fps;
-
-    const filterComplex = buildFilterComplex({
-      assPath,
-      title: payload.text.title,
-      footer: payload.text.footer,
-      audioSec,
-      videoSec,
-      disableSubtitles: payload.debug.disableSubtitles,
-    });
-
-    // IMPORTANT: finite image inputs (no infinite -loop without -t)
-    // Audio padded by 4s and trimmed by -t
-    //
-    // FFmpeg progress:
-    //  -progress pipe:2 prints key=value
-    //  -nostats reduces noise
-    const ffmpegArgs = [
-      "-y",
-      "-hide_banner",
-      "-loglevel", "warning",
-
-      // Progress info (diagnostic)
-      "-nostats",
-      "-progress", "pipe:2",
-
-      // BG finite
-      "-loop", "1",
-      "-framerate", String(fps),
-      "-t", videoSec.toFixed(3),
-      "-i", baseBgPath,
-
-      // Audio
-      "-i", audioPath,
-
-      // End card finite
-      "-loop", "1",
-      "-framerate", String(fps),
-      "-t", videoSec.toFixed(3),
-      "-i", endCardPath,
-
-      // Compose
-      "-filter_complex", filterComplex,
-
-      // Extend audio by 4s
-      "-filter:a", "apad=pad_dur=4",
-
-      // Map
-      "-map", "[vout]",
-      "-map", "1:a",
-
-      // Stop guards
-      "-shortest",
-      "-t", videoSec.toFixed(3),
-
-      // Encode (low CPU for free plan)
-      "-r", String(fps),
-      "-fps_mode", "cfr",
-      "-c:v", "libx264",
-      "-pix_fmt", "yuv420p",
-      "-profile:v", "high",
-      "-preset", "ultrafast",
-      "-tune", "stillimage",
-      "-threads", "1",
-      "-crf", "24",
-
-      "-c:a", "aac",
-      "-b:a", "160k",
-
-      "-movflags", "+faststart",
-      outPath,
-    ];
-
-    log(reqId, `[/render] ffmpeg start (timeout=${FFMPEG_TIMEOUT_MS} hard=${HARD_TIMEOUT_MS})`);
-
-    const ff = await runFfmpegWithProgress({
-      reqId,
-      args: ffmpegArgs,
-      timeoutMs: FFMPEG_TIMEOUT_MS,
-      hardTimeoutMs: HARD_TIMEOUT_MS,
-    });
-
-    log(reqId, "[/render] done");
-
-    const downloadUrl = `${req.protocol}://${req.get("host")}/tmp/${outName}`;
-    return res.json({
-      ok: true,
-      download_url: downloadUrl,
-      debug: {
-        audio_ms: audioMs,
-        video_ms: videoMs,
-        elapsed_ms: Date.now() - startedAt,
-        disable_subtitles: payload.debug.disableSubtitles,
-        ffmpeg_last: ff.ffmpeg_last,
-        ffmpeg_samples: ff.ffmpeg_samples,
-      },
-    });
-  } catch (err) {
-    log(reqId, "[/render] error", err?.message || err);
-
-    if (err?.code === "ETIMEDOUT" || err?.code === "HARD_TIMEOUT") {
-      return res.status(504).json({
+    if (!payload) {
+      return res.status(400).json({
         ok: false,
-        error: "Render timeout",
-        debug: {
-          ffmpeg_last: err.ffmpeg_last,
-          ffmpeg_samples: err.ffmpeg_samples,
-        },
+        error: 'Invalid JSON in form-data field: payload',
+        hint: 'Make sure payload is a valid JSON string',
       });
     }
 
+    // Always return something useful (so Make can debug)
+    const meta = {
+      received: {
+        audio: { originalname: req.file.originalname, mimetype: req.file.mimetype, size: req.file.size },
+        payload_keys: Object.keys(payload || {}),
+      },
+    };
+
+    // If no background_video_url, we just acknowledge (fixes your current "Cannot POST /" issue)
+    if (!payload.background_video_url) {
+      return res.status(200).json({
+        ok: true,
+        mode: 'ack',
+        message: 'POST / received. Add payload.background_video_url to enable MP4 rendering.',
+        meta,
+        ms: Date.now() - startedAt,
+      });
+    }
+
+    // ---- Render MP4 ----
+    const audioExt = (() => {
+      const n = (req.file.originalname || '').toLowerCase();
+      if (n.endsWith('.mp3')) return '.mp3';
+      if (n.endsWith('.wav')) return '.wav';
+      if (n.endsWith('.m4a')) return '.m4a';
+      if (n.endsWith('.aac')) return '.aac';
+      return '.bin';
+    })();
+
+    const audioPath = tmpName('audio', audioExt);
+    const bgPath = tmpName('bg', '.mp4');
+    const outPath = tmpName('out', '.mp4');
+    const srtPath = tmpName('subs', '.srt');
+
+    await fsp.writeFile(audioPath, req.file.buffer);
+
+    // download background video
+    await downloadToFile(payload.background_video_url, bgPath);
+
+    // durations
+    const audioDur = await ffprobeDurationSeconds(audioPath);
+    const extraTail = Number.isFinite(Number(payload.extra_tail_seconds))
+      ? Math.max(0, Number(payload.extra_tail_seconds))
+      : 4;
+
+    const targetDur = audioDur + extraTail;
+
+    // subtitles (optional)
+    let vf = [
+      // Reels friendly
+      "scale=1080:1920:force_original_aspect_ratio=increase",
+      "crop=1080:1920",
+      "fps=30",
+      "format=yuv420p",
+      `trim=duration=${targetDur}`,
+      "setpts=PTS-STARTPTS",
+    ];
+
+    if (typeof payload.subtitles_srt === 'string' && payload.subtitles_srt.trim()) {
+      await fsp.writeFile(srtPath, payload.subtitles_srt, 'utf8');
+      // Basic styling; you can tweak later
+      vf.push(`subtitles=${srtPath}:force_style='FontName=DejaVu Sans,FontSize=48,PrimaryColour=&HFFFFFF&,OutlineColour=&H000000&,BorderStyle=3,Outline=2,Shadow=0,MarginV=140'`);
+    } else {
+      // remove unused path
+      try { await fsp.unlink(srtPath); } catch {}
+    }
+
+    const filterComplex = [
+      // Video (loop if needed)
+      `[0:v]${vf.join(',')}[v]`,
+      // Audio: pad silence to reach targetDur, then trim exact length
+      `[1:a]apad=pad_dur=${extraTail},atrim=0:${targetDur},asetpts=PTS-STARTPTS[a]`,
+    ].join(';');
+
+    const ffmpegArgs = [
+      // loop background infinitely, we trim anyway
+      '-stream_loop', '-1',
+      '-i', bgPath,
+      '-i', audioPath,
+      '-filter_complex', filterComplex,
+      '-map', '[v]',
+      '-map', '[a]',
+      '-t', String(targetDur),
+      '-c:v', 'libx264',
+      '-preset', 'veryfast',
+      '-crf', '23',
+      '-c:a', 'aac',
+      '-b:a', '192k',
+      '-movflags', '+faststart',
+      outPath,
+    ];
+
+    await run('ffmpeg', ffmpegArgs, { timeoutMs: 15 * 60 * 1000 });
+
+    const responseMode = (payload.response_mode || 'json').toLowerCase();
+
+    if (responseMode === 'binary') {
+      // Send MP4 directly
+      res.setHeader('Content-Type', 'video/mp4');
+      res.setHeader('Content-Disposition', 'inline; filename="render.mp4"');
+      const stream = fs.createReadStream(outPath);
+      stream.on('close', async () => {
+        // cleanup
+        for (const p of [audioPath, bgPath, outPath]) { try { await fsp.unlink(p); } catch {} }
+      });
+      return stream.pipe(res);
+    }
+
+    // Default: JSON response (works with Make "Parse response = Yes")
+    const mp4Buf = await fsp.readFile(outPath);
+    const base64 = mp4Buf.toString('base64');
+
+    // cleanup
+    for (const p of [audioPath, bgPath, outPath]) { try { await fsp.unlink(p); } catch {} }
+
+    return res.status(200).json({
+      ok: true,
+      mode: 'rendered',
+      ms: Date.now() - startedAt,
+      audio_duration_s: audioDur,
+      target_duration_s: targetDur,
+      file: {
+        filename: 'render.mp4',
+        mime: 'video/mp4',
+        encoding: 'base64',
+        data: base64,
+      },
+      meta,
+    });
+  } catch (err) {
     return res.status(500).json({
       ok: false,
-      error: err?.message || "Unknown error",
-      debug: {
-        code: err?.code,
-        ffmpeg_last: err?.ffmpeg_last,
-        ffmpeg_samples: err?.ffmpeg_samples,
-      },
+      error: err && err.message ? err.message : String(err),
     });
-  } finally {
-    renderBusy = false;
-
-    // Cleanup
-    try { if (audioPath && fs.existsSync(audioPath)) await fsp.unlink(audioPath); } catch {}
-    try { if (assPath && fs.existsSync(assPath)) await fsp.unlink(assPath); } catch {}
   }
 });
 
-// ---------- Start + graceful shutdown ----------
-const PORT = process.env.PORT || 3000;
-const server = app.listen(PORT, () => {
-  console.log(`motionalyx-render-endpoint listening on :${PORT}`);
+// ---- Start ----
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Server listening on port ${PORT}`);
 });
-
-function shutdown(signal) {
-  console.log(`${nowIso()} [shutdown] received ${signal}`);
-  server.close(() => {
-    console.log(`${nowIso()} [shutdown] server closed`);
-    process.exit(0);
-  });
-  setTimeout(() => process.exit(1), 5000).unref();
-}
-process.on("SIGTERM", () => shutdown("SIGTERM"));
-process.on("SIGINT", () => shutdown("SIGINT"));
