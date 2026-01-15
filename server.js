@@ -1,5 +1,5 @@
 // server.js (Node 20, ES modules)
-// Motionalyx Render Endpoint — Option 3 (CORE, stable on Render free plan)
+// Motionalyx Render Endpoint — Option 3 (CORE, stabilized)
 //
 // Endpoints:
 //   GET  /        -> "ok"
@@ -8,21 +8,21 @@
 //        file field:  audio (mp3)
 //        text field:  payload (JSON string)
 //
-// Behavior:
-// - Measure audio duration (ffprobe).
-// - Subtitles shown ONLY during audio (0..audio_end).
-// - Title/Footer shown ONLY during audio.
-// - End card full-screen ONLY during last 4s (audio_end..video_end).
-// - Video length = audio length + 4s.
+// Core behavior:
+// - Measure audio length (ffprobe).
+// - Subtitles + title/footer only during audio (0..audio_end).
+// - End card full-screen only last 4s (audio_end..video_end).
+// - video length = audio length + 4s.
 // - Output: 1080x1920 30fps H.264 + AAC + faststart
 //
-// Robustness:
-// - Caches assets in /tmp/mxcache (hash filenames).
-// - Serves outputs from /tmp/mxpublic via /tmp/<file>.mp4
-// - Hard timeout -> 504 (so Make won't hang).
-// - Logs markers: request start, ffmpeg start, done, error
-// - Limits ffmpeg CPU: ultrafast + threads=1 + tune stillimage
-// - Single render at a time (returns 503 if busy)
+// Robustness for Render free plan:
+// - Cache assets in /tmp/mxcache
+// - Serve mp4 from /tmp/mxpublic under /tmp/<file>.mp4
+// - Single render at a time (503 if busy)
+// - Hard timeout that KILLS ffmpeg and returns 504 (Make won't hang)
+// - Less ffmpeg load: ultrafast + stillimage + threads=1
+// - IMPORTANT: images are not infinite loop sources (they get -t videoSec on input)
+// - Logs: request start, ffmpeg start, done, error
 
 import express from "express";
 import multer from "multer";
@@ -78,24 +78,22 @@ const storage = multer.diskStorage({
     cb(null, `${id}${ext}`);
   },
 });
-
 const upload = multer({
   storage,
   limits: {
-    fileSize: 25 * 1024 * 1024, // 25MB
+    fileSize: 25 * 1024 * 1024,
     files: 1,
     fields: 30,
   },
 });
 
-// ---------- Global single-render lock ----------
+// ---------- Single-render lock ----------
 let renderBusy = false;
 
 // ---------- Helpers ----------
 function sha1(str) {
   return crypto.createHash("sha1").update(str).digest("hex");
 }
-
 function safeJsonParse(str) {
   try {
     return { ok: true, value: JSON.parse(str) };
@@ -103,19 +101,13 @@ function safeJsonParse(str) {
     return { ok: false, error: e };
   }
 }
-
 function nowIso() {
   return new Date().toISOString();
 }
-
 function log(reqId, msg, extra) {
-  if (extra !== undefined) {
-    console.log(`${nowIso()} [${reqId}] ${msg}`, extra);
-  } else {
-    console.log(`${nowIso()} [${reqId}] ${msg}`);
-  }
+  if (extra !== undefined) console.log(`${nowIso()} [${reqId}] ${msg}`, extra);
+  else console.log(`${nowIso()} [${reqId}] ${msg}`);
 }
-
 async function exists(p) {
   try {
     await fsp.access(p);
@@ -124,7 +116,6 @@ async function exists(p) {
     return false;
   }
 }
-
 async function findExistingCached(filePathBase) {
   const exts = [".png", ".jpg", ".jpeg", ".webp", ".bin"];
   for (const ext of exts) {
@@ -135,9 +126,10 @@ async function findExistingCached(filePathBase) {
   return null;
 }
 
-// Download with cache (Node 20 has global fetch)
+// Download with cache (with timeout)
 async function downloadToCache(url, { timeoutMs = 20000 } = {}) {
   if (!url || typeof url !== "string") throw new Error("Missing asset URL");
+
   const key = sha1(url);
   const filePathBase = path.join(CACHE_DIR, key);
 
@@ -183,23 +175,24 @@ async function downloadToCache(url, { timeoutMs = 20000 } = {}) {
   return outPath;
 }
 
-function spawnLogged(cmd, args, { timeoutMs = 0, reqId = "na", prefix = "" } = {}) {
+// Spawn with timeout + optional abort signal that kills the process
+function spawnLogged(cmd, args, { timeoutMs = 0, reqId = "na", prefix = "", abortSignal } = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
 
     let stdout = "";
     let stderr = "";
     let killedByTimeout = false;
+    let killedByAbort = false;
 
     const onData = (streamName) => (d) => {
       const s = d.toString();
       if (streamName === "stdout") stdout += s;
       else stderr += s;
 
-      // stream ffmpeg warnings to logs for debug (trim very noisy)
+      // stream key ffmpeg lines to logs
       const lines = s.split("\n").map((x) => x.trim()).filter(Boolean);
       for (const line of lines) {
-        // keep it readable
         log(reqId, `${prefix}${streamName}: ${line.slice(0, 500)}`);
       }
     };
@@ -217,6 +210,18 @@ function spawnLogged(cmd, args, { timeoutMs = 0, reqId = "na", prefix = "" } = {
       }, timeoutMs);
     }
 
+    const abortHandler = () => {
+      killedByAbort = true;
+      try {
+        child.kill("SIGKILL");
+      } catch {}
+    };
+
+    if (abortSignal) {
+      if (abortSignal.aborted) abortHandler();
+      else abortSignal.addEventListener("abort", abortHandler, { once: true });
+    }
+
     child.on("error", (err) => {
       if (t) clearTimeout(t);
       reject(err);
@@ -224,6 +229,21 @@ function spawnLogged(cmd, args, { timeoutMs = 0, reqId = "na", prefix = "" } = {
 
     child.on("close", (code) => {
       if (t) clearTimeout(t);
+
+      if (abortSignal) {
+        try {
+          abortSignal.removeEventListener("abort", abortHandler);
+        } catch {}
+      }
+
+      if (killedByAbort) {
+        const err = new Error(`${cmd} killed by hard timeout abort`);
+        err.code = "HARD_TIMEOUT";
+        err.stdout = stdout;
+        err.stderr = stderr;
+        return reject(err);
+      }
+
       if (killedByTimeout) {
         const err = new Error(`${cmd} timeout after ${timeoutMs}ms`);
         err.code = "ETIMEDOUT";
@@ -231,7 +251,9 @@ function spawnLogged(cmd, args, { timeoutMs = 0, reqId = "na", prefix = "" } = {
         err.stderr = stderr;
         return reject(err);
       }
+
       if (code === 0) return resolve({ stdout, stderr });
+
       const err = new Error(`${cmd} exited with code ${code}`);
       err.code = code;
       err.stdout = stdout;
@@ -264,7 +286,7 @@ function escapeDrawtextText(input) {
     .replace(/\r\n|\r|\n/g, "\\n");
 }
 
-// Subtitles wrap: max 2 lines, max 26 chars/line (simple word wrap)
+// Subtitles wrap: max 2 lines, max 26 chars/line
 function wrapSubtitle(text, maxChars = 26, maxLines = 2) {
   const raw = String(text ?? "").trim().replace(/\s+/g, " ");
   if (!raw) return "";
@@ -279,9 +301,8 @@ function wrapSubtitle(text, maxChars = 26, maxLines = 2) {
       current = w;
       continue;
     }
-    if ((current + " " + w).length <= maxChars) {
-      current += " " + w;
-    } else {
+    if ((current + " " + w).length <= maxChars) current += " " + w;
+    else {
       lines.push(current);
       current = w;
       if (lines.length === maxLines) break;
@@ -292,7 +313,6 @@ function wrapSubtitle(text, maxChars = 26, maxLines = 2) {
   for (let i = 0; i < lines.length; i++) {
     if (lines[i].length > maxChars) lines[i] = lines[i].slice(0, maxChars);
   }
-
   return lines.slice(0, maxLines).join("\\N");
 }
 
@@ -306,7 +326,6 @@ function msToAssTime(ms) {
   return `${h}:${pad2(m)}:${pad2(s)}.${pad2(cs)}`;
 }
 
-// If input subtitles end != audio length, scale all chunks proportionally
 function scaleSubtitleLinesToAudio(lines, audioMs) {
   if (!Array.isArray(lines) || lines.length === 0) return [];
   const lastEnd = Number(lines[lines.length - 1]?.end_ms);
@@ -334,21 +353,22 @@ function scaleSubtitleLinesToAudio(lines, audioMs) {
     out[i].start_ms = Math.max(0, out[i].start_ms);
     out[i].end_ms = Math.max(out[i].start_ms + 1, out[i].end_ms);
   }
-
   return out;
 }
 
 async function writeAssFile(lines, outPath) {
+  // Add PlayResX/PlayResY to avoid libass assumptions
   const header = [
     "[Script Info]",
     "ScriptType: v4.00+",
+    "PlayResX: 1080",
+    "PlayResY: 1920",
     "WrapStyle: 0",
     "ScaledBorderAndShadow: yes",
     "YCbCr Matrix: TV.709",
     "",
     "[V4+ Styles]",
     "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
-    // Alignment=2 bottom center. MarginV moves up from bottom (avoid UI/pill).
     "Style: Default,DejaVu Sans,56,&H00FFFFFF,&H000000FF,&H00000000,&H64000000,0,0,0,0,100,100,0,0,1,3,1,2,60,60,160,1",
     "",
     "[Events]",
@@ -360,8 +380,6 @@ async function writeAssFile(lines, outPath) {
     const start = msToAssTime(l.start_ms);
     const end = msToAssTime(l.end_ms);
     const wrapped = wrapSubtitle(l.text, 26, 2);
-
-    // minimal ASS escaping
     const safe = wrapped.replace(/{/g, "\\{").replace(/}/g, "\\}");
     events.push(`Dialogue: 0,${start},${end},Default,,0,0,0,,${safe}`);
   }
@@ -370,7 +388,6 @@ async function writeAssFile(lines, outPath) {
 }
 
 function buildFilterComplex({ assPath, title, footer, audioSec, videoSec }) {
-  // IMPORTANT: no trailing ";" and no empty segments
   const filters = [];
 
   const assEsc = assPath.replace(/\\/g, "\\\\").replace(/:/g, "\\:");
@@ -379,20 +396,15 @@ function buildFilterComplex({ assPath, title, footer, audioSec, videoSec }) {
   const tText = escapeDrawtextText(title);
   const fText = escapeDrawtextText(footer);
 
-  // enable expressions MUST escape commas: t\,X
   const enableAudioOnly = `lt(t\\,${audioSec.toFixed(3)})`;
 
-  // Title (top)
   filters.push(
     `[v0]drawtext=fontfile=${FONT_FILE}:text='${tText}':fontsize=78:fontcolor=white:x=(w-text_w)/2:y=320:shadowcolor=black:shadowx=2:shadowy=2:enable='${enableAudioOnly}'[v1]`
   );
-
-  // Footer (above subtitles)
   filters.push(
     `[v1]drawtext=fontfile=${FONT_FILE}:text='${fText}':fontsize=54:fontcolor=white:x=(w-text_w)/2:y=1520:shadowcolor=black:shadowx=2:shadowy=2:enable='${enableAudioOnly}'[v2]`
   );
 
-  // End card overlay: full screen during last 4 seconds
   const enableEndCard = `between(t\\,${audioSec.toFixed(3)}\\,${videoSec.toFixed(3)})`;
   filters.push(`[v2][2:v]overlay=0:0:enable='${enableEndCard}'[vout]`);
 
@@ -442,23 +454,17 @@ app.post("/render", upload.single("audio"), async (req, res) => {
   const startedAt = Date.now();
 
   if (renderBusy) {
-    // Render free plan: keep it simple; no parallel ffmpeg
     return res.status(503).json({ ok: false, error: "Renderer busy. Try again." });
   }
-
   renderBusy = true;
+
   log(reqId, "[/render] request start");
 
-  // Timeouts (Make has 300s)
-  const HARD_TIMEOUT_MS = Number(process.env.HARD_TIMEOUT_MS || 240000);   // overall
-  const FFMPEG_TIMEOUT_MS = Number(process.env.FFMPEG_TIMEOUT_MS || 210000); // ffmpeg only
+  const HARD_TIMEOUT_MS = Number(process.env.HARD_TIMEOUT_MS || 240000);
+  const FFMPEG_TIMEOUT_MS = Number(process.env.FFMPEG_TIMEOUT_MS || 210000);
 
-  // Hard kill guard
-  let hardTimer = null;
-  const hardAbort = { aborted: false };
-  hardTimer = setTimeout(() => {
-    hardAbort.aborted = true;
-  }, HARD_TIMEOUT_MS);
+  const hardController = new AbortController();
+  const hardTimer = setTimeout(() => hardController.abort(), HARD_TIMEOUT_MS);
 
   let audioPath = null;
   let assPath = null;
@@ -485,13 +491,13 @@ app.post("/render", upload.single("audio"), async (req, res) => {
     const baseBgPath = await downloadToCache(payload.assets.base_background_url);
     const endCardPath = await downloadToCache(payload.assets.end_card_url);
 
-    // Measure audio
+    // Measure audio duration
     const audioMs = await ffprobeDurationMs(audioPath, { reqId });
     const audioSec = audioMs / 1000;
     const videoSec = audioSec + 4.0;
     const videoMs = Math.round(videoSec * 1000);
 
-    // Scale subtitles to audio length
+    // Subtitles: scale to match audio
     const scaledLines = scaleSubtitleLinesToAudio(payload.subtitles.lines, audioMs);
 
     // Write ASS
@@ -512,44 +518,47 @@ app.post("/render", upload.single("audio"), async (req, res) => {
       videoSec,
     });
 
-    // ---------- ffmpeg args (optimized for Render free plan) ----------
-    // -threads 1 reduces CPU spikes (stability)
-    // -preset ultrafast + -tune stillimage reduces encode load
-    // CRF slightly higher for speed; you can lower later for quality.
     const fps = payload.spec.fps;
 
+    // IMPORTANT change:
+    // images are NOT infinite: give them -t videoSec so ffmpeg has finite streams
     const ffmpegArgs = [
       "-y",
       "-hide_banner",
-      "-loglevel",
-      "warning",
+      "-loglevel", "warning",
 
-      // Base background (looped)
+      // Base background (finite)
       "-loop", "1",
+      "-framerate", String(fps),
+      "-t", videoSec.toFixed(3),
       "-i", baseBgPath,
 
       // Audio
       "-i", audioPath,
 
-      // End card (looped)
+      // End card (finite)
       "-loop", "1",
+      "-framerate", String(fps),
+      "-t", videoSec.toFixed(3),
       "-i", endCardPath,
 
       // Compose
       "-filter_complex", filterComplex,
 
-      // Extend audio by 4s silence then trim to exact duration
+      // Extend audio by 4s silence
       "-filter:a", "apad=pad_dur=4",
 
       // Map
       "-map", "[vout]",
       "-map", "1:a",
 
-      // Exact total duration
+      // Extra stop guard
+      "-shortest",
       "-t", videoSec.toFixed(3),
 
-      // Video encode
+      // Encode (low CPU)
       "-r", String(fps),
+      "-vsync", "cfr",
       "-c:v", "libx264",
       "-pix_fmt", "yuv420p",
       "-profile:v", "high",
@@ -558,11 +567,9 @@ app.post("/render", upload.single("audio"), async (req, res) => {
       "-threads", "1",
       "-crf", "24",
 
-      // Audio encode
       "-c:a", "aac",
       "-b:a", "160k",
 
-      // Fast start for web playback
       "-movflags", "+faststart",
 
       outPath,
@@ -570,21 +577,16 @@ app.post("/render", upload.single("audio"), async (req, res) => {
 
     log(reqId, "[/render] ffmpeg start");
 
-    // If hard timeout already triggered, abort early
-    if (hardAbort.aborted) {
-      return res.status(504).json({
-        ok: false,
-        error: "Hard timeout before ffmpeg",
-        debug: { audio_ms: audioMs, video_ms: videoMs },
-      });
-    }
-
-    // Run ffmpeg with timeout
     try {
-      await spawnLogged("ffmpeg", ffmpegArgs, { timeoutMs: FFMPEG_TIMEOUT_MS, reqId, prefix: "[ffmpeg] " });
+      await spawnLogged("ffmpeg", ffmpegArgs, {
+        timeoutMs: FFMPEG_TIMEOUT_MS,
+        reqId,
+        prefix: "[ffmpeg] ",
+        abortSignal: hardController.signal, // HARD timeout kills ffmpeg
+      });
     } catch (err) {
-      if (err?.code === "ETIMEDOUT") {
-        log(reqId, "[/render] error timeout");
+      if (err?.code === "ETIMEDOUT" || err?.code === "HARD_TIMEOUT") {
+        log(reqId, "[/render] timeout");
         return res.status(504).json({
           ok: false,
           error: "Render timeout",
@@ -592,16 +594,6 @@ app.post("/render", upload.single("audio"), async (req, res) => {
         });
       }
       throw err;
-    }
-
-    // If hard timeout triggered after ffmpeg, still respond as timeout (safer for Make)
-    if (hardAbort.aborted) {
-      log(reqId, "[/render] hard timeout after ffmpeg");
-      return res.status(504).json({
-        ok: false,
-        error: "Hard timeout",
-        debug: { audio_ms: audioMs, video_ms: videoMs },
-      });
     }
 
     log(reqId, "[/render] done");
@@ -628,10 +620,10 @@ app.post("/render", upload.single("audio"), async (req, res) => {
       debug,
     });
   } finally {
+    clearTimeout(hardTimer);
     renderBusy = false;
-    if (hardTimer) clearTimeout(hardTimer);
 
-    // Cleanup uploads + temp ass (best effort)
+    // Cleanup
     try {
       if (audioPath && fs.existsSync(audioPath)) await fsp.unlink(audioPath);
     } catch {}
@@ -641,9 +633,10 @@ app.post("/render", upload.single("audio"), async (req, res) => {
   }
 });
 
-// ---------- Graceful shutdown (helps when Render sends SIGTERM) ----------
-const server = app.listen(process.env.PORT || 3000, () => {
-  console.log(`motionalyx-render-endpoint listening on :${process.env.PORT || 3000}`);
+// ---------- Start + graceful shutdown ----------
+const PORT = process.env.PORT || 3000;
+const server = app.listen(PORT, () => {
+  console.log(`motionalyx-render-endpoint listening on :${PORT}`);
 });
 
 function shutdown(signal) {
@@ -652,9 +645,7 @@ function shutdown(signal) {
     console.log(`${nowIso()} [shutdown] server closed`);
     process.exit(0);
   });
-  // Force exit if it hangs
   setTimeout(() => process.exit(1), 5000).unref();
 }
-
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
